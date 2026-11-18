@@ -1,0 +1,22 @@
+[workspace]
+members = ["client", "server", "shared"]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+authors = ["ABD <cryogenicdeadfrost>"]
+
+[workspace.dependencies]
+anyhow = "1"
+clap = { version = "4.5", features = ["derive"] }
+cpal = "0.18"
+rusty-opus = "1.0"
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true
+opt-level = "z"
+panic = "abort"
