@@ -4,17 +4,80 @@ use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{FromSample, SizedSample};
 use rusty_opus::OpusDecoder;
 use sonic_bridge_shared::{CHANNELS, FRAME_MS, FRAME_SAMPLES, PacketHeader, SAMPLE_RATE};
-use std::{net::UdpSocket, sync::mpsc, time::Duration};
+use std::{
+    collections::BTreeMap,
+    net::UdpSocket,
+    sync::mpsc,
+    time::{Duration, Instant},
+};
 
 #[derive(Parser, Debug)]
 #[command(
     name = "sonic-bridge-server",
-    about = "Receive SonicBridge audio and play it through Linux"
+    about = "Receive, play, and optionally relay SonicBridge audio"
 )]
 struct Args {
     /// Address to listen on.
     #[arg(long, default_value = "0.0.0.0:8765")]
     listen: String,
+
+    /// Forward received packets to another SonicBridge node.
+    #[arg(long)]
+    forward_to: Option<String>,
+
+    /// Do not play locally. Useful for a pure relay Pi.
+    #[arg(long, default_value_t = false)]
+    relay_only: bool,
+
+    /// Packet buffering before playback, in milliseconds.
+    #[arg(long, default_value_t = 60)]
+    jitter_ms: u32,
+}
+
+struct JitterBuffer {
+    packets: BTreeMap<u32, Vec<u8>>,
+    next_sequence: Option<u32>,
+    target_frames: usize,
+}
+
+impl JitterBuffer {
+    fn new(jitter_ms: u32) -> Self {
+        Self {
+            packets: BTreeMap::new(),
+            next_sequence: None,
+            target_frames: (jitter_ms / FRAME_MS as u32).max(1) as usize,
+        }
+    }
+
+    fn insert(&mut self, sequence: u32, payload: &[u8]) {
+        if self.next_sequence.is_none() {
+            self.next_sequence = Some(sequence);
+        }
+
+        if let Some(next) = self.next_sequence {
+            if sequence.wrapping_sub(next) < 0x8000_0000 {
+                self.packets.entry(sequence).or_insert_with(|| payload.to_vec());
+            }
+        }
+    }
+
+    fn ready(&self) -> bool {
+        self.packets.len() >= self.target_frames
+    }
+
+    fn pop_next(&mut self) -> Option<(u32, Vec<u8>)> {
+        let sequence = self.next_sequence?;
+
+        if let Some(payload) = self.packets.remove(&sequence) {
+            self.next_sequence = Some(sequence.wrapping_add(1));
+            Some((sequence, payload))
+        } else if self.ready() {
+            self.next_sequence = Some(sequence.wrapping_add(1));
+            Some((sequence, Vec::new()))
+        } else {
+            None
+        }
+    }
 }
 
 fn main() -> Result<()> {
@@ -29,48 +92,81 @@ fn main() -> Result<()> {
 
     let host = cpal::default_host();
 
-    let device = host
-        .default_output_device()
-        .context("Linux has no default output device")?;
-
-    let config = device
-        .default_output_config()
-        .context("could not open the default Linux audio output")?;
-
-    if config.channels() != CHANNELS as u16 || config.sample_rate().0 != SAMPLE_RATE {
-        anyhow::bail!(
-            "SonicBridge needs a 48 kHz stereo output (found {} Hz / {} channels)",
-            config.sample_rate().0,
-            config.channels()
-        );
-    }
-
-    eprintln!("SonicBridge server");
-    eprintln!("Listening on {}", args.listen);
-    eprintln!(
-        "Output: {}",
-        device.name().unwrap_or_else(|_| "unknown".into())
-    );
-
-    // Six frames gives us a small amount of breathing room without turning
-    // the receiver into a delayed radio station.
-    let (tx, rx) = mpsc::sync_channel::<Vec<f32>>(6);
-
-    let stream = match config.sample_format() {
-        cpal::SampleFormat::F32 => build_output::<f32>(&device, &config.into(), rx)?,
-        cpal::SampleFormat::I16 => build_output::<i16>(&device, &config.into(), rx)?,
-        cpal::SampleFormat::U16 => build_output::<u16>(&device, &config.into(), rx)?,
-        other => anyhow::bail!("unsupported Linux sample format: {other:?}"),
+    let device = if args.relay_only {
+        None
+    } else {
+        Some(
+            host.default_output_device()
+                .context("Linux has no default output device")?,
+        )
     };
 
-    stream.play().context("could not start Linux audio playback")?;
+    let (tx, stream) = if let Some(device) = device {
+        let config = device
+            .default_output_config()
+            .context("could not open the default Linux audio output")?;
 
-    let mut decoder = OpusDecoder::new(SAMPLE_RATE as i32, CHANNELS as usize)
-        .context("could not initialise Opus decoder")?;
+        if config.channels() != CHANNELS as u16 || config.sample_rate().0 != SAMPLE_RATE {
+            anyhow::bail!(
+                "SonicBridge needs a 48 kHz stereo output (found {} Hz / {} channels)",
+                config.sample_rate().0,
+                config.channels()
+            );
+        }
 
+        eprintln!(
+            "Output: {}",
+            device.name().unwrap_or_else(|_| "unknown".into())
+        );
+
+        let (tx, rx) = mpsc::sync_channel::<Vec<f32>>(6);
+
+        let stream = match config.sample_format() {
+            cpal::SampleFormat::F32 => build_output::<f32>(&device, &config.into(), rx)?,
+            cpal::SampleFormat::I16 => build_output::<i16>(&device, &config.into(), rx)?,
+            cpal::SampleFormat::U16 => build_output::<u16>(&device, &config.into(), rx)?,
+            other => anyhow::bail!("unsupported Linux sample format: {other:?}"),
+        };
+
+        stream.play().context("could not start Linux audio playback")?;
+        (Some(tx), Some(stream))
+    } else {
+        (None, None)
+    };
+
+    eprintln!("SonicBridge server v0.2");
+    eprintln!("Listening on {}", args.listen);
+    eprintln!("Relay target: {}", args.forward_to.as_deref().unwrap_or("none"));
+    eprintln!("Relay only: {}", args.relay_only);
+    eprintln!("Jitter buffer: {} ms", args.jitter_ms);
+
+    let forward_socket = if args.forward_to.is_some() {
+        Some(
+            UdpSocket::bind("0.0.0.0:0")
+                .context("could not create relay UDP socket")?,
+        )
+    } else {
+        None
+    };
+
+    let mut decoder = if args.relay_only {
+        None
+    } else {
+        Some(
+            OpusDecoder::new(SAMPLE_RATE as i32, CHANNELS as usize)
+                .context("could not initialise Opus")?,
+        )
+    };
+
+    let mut jitter = JitterBuffer::new(args.jitter_ms);
     let mut buf = [0u8; 2048];
     let mut decoded = vec![0.0f32; FRAME_SAMPLES * CHANNELS as usize];
-    let mut last_sequence: Option<u32> = None;
+
+    let mut received = 0u64;
+    let mut forwarded = 0u64;
+    let mut concealed = 0u64;
+    let mut dropped = 0u64;
+    let mut last_report = Instant::now();
 
     loop {
         let len = match socket.recv(&mut buf) {
@@ -88,40 +184,76 @@ fn main() -> Result<()> {
 
         let (header, payload) = match PacketHeader::decode(&buf[..len]) {
             Ok(packet) => packet,
-            Err(_) => continue,
+            Err(_) => {
+                dropped += 1;
+                continue;
+            }
         };
 
         if header.sample_rate != SAMPLE_RATE
             || header.channels != CHANNELS
             || header.frame_ms != FRAME_MS
         {
+            dropped += 1;
             continue;
         }
 
-        // If packets vanished in transit, Opus can generate a concealed frame
-        // instead of making the listener hear a tiny but very noticeable hole.
-        if let Some(previous) = last_sequence {
-            let gap = header.sequence.wrapping_sub(previous);
+        received += 1;
 
-            if gap > 1 && gap < 32 {
-                for _ in 0..(gap - 1) {
-                    if decoder.decode(&[], FRAME_SAMPLES, &mut decoded).is_ok() {
-                        let _ = tx.try_send(decoded.clone());
-                    }
+        if let (Some(target), Some(relay_socket)) = (&args.forward_to, &forward_socket) {
+            if let Some(next_header) = header.decremented_ttl() {
+                let mut relay_packet = Vec::with_capacity(len);
+                next_header.encode(payload, &mut relay_packet);
+
+                if relay_socket.send_to(&relay_packet, target).is_ok() {
+                    forwarded += 1;
                 }
             }
         }
 
-        last_sequence = Some(header.sequence);
-
-        match decoder.decode(payload, FRAME_SAMPLES, &mut decoded) {
-            Ok(samples) if samples == FRAME_SAMPLES => {
-                // If playback is behind, sacrifice this frame rather than
-                // letting latency grow forever.
-                let _ = tx.try_send(decoded.clone());
-            }
-            Ok(_) | Err(_) => {}
+        if args.relay_only {
+            continue;
         }
+
+        jitter.insert(header.sequence, payload);
+
+        while let Some((_sequence, packet)) = jitter.pop_next() {
+            if packet.is_empty() {
+                if let Some(decoder) = decoder.as_mut() {
+                    if decoder.decode(&[], FRAME_SAMPLES, &mut decoded).is_ok() {
+                        if tx.as_ref().unwrap().try_send(decoded.clone()).is_ok() {
+                            concealed += 1;
+                        }
+                    }
+                }
+                continue;
+            }
+
+            if let Some(decoder) = decoder.as_mut() {
+                match decoder.decode(&packet, FRAME_SAMPLES, &mut decoded) {
+                    Ok(samples) if samples == FRAME_SAMPLES => {
+                        if tx.as_ref().unwrap().try_send(decoded.clone()).is_err() {
+                            dropped += 1;
+                        }
+                    }
+                    Ok(_) | Err(_) => dropped += 1,
+                }
+            }
+        }
+
+        if last_report.elapsed() >= Duration::from_secs(5) {
+            eprintln!(
+                "stats: rx={} forwarded={} concealed={} dropped={}",
+                received, forwarded, concealed, dropped
+            );
+            last_report = Instant::now();
+        }
+    }
+
+    #[allow(unreachable_code)]
+    {
+        drop(stream);
+        Ok(())
     }
 }
 
@@ -147,7 +279,6 @@ where
                             index = 0;
                         }
                         Err(_) => {
-                            // Silence beats a callback that blocks forever.
                             *sample = T::from_sample(0.0);
                             continue;
                         }

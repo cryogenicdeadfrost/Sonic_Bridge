@@ -1,0 +1,10 @@
+[package]
+name = "sonic-bridge-ui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+eframe = "0.37.0"
+anyhow.workspace = true
+sonic-bridge-shared = { path = "../shared" }

@@ -7,6 +7,6 @@ license.workspace = true
 [dependencies]
 anyhow.workspace = true
 clap.workspace = true
-cpal.workspace = true
+flexaudio.workspace = true
 rusty-opus.workspace = true
 sonic-bridge-shared = { path = "../shared" }
