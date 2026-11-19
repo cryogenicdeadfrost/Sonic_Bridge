@@ -1,9 +1,9 @@
 [workspace]
-members = ["client", "server", "shared"]
+members = ["client", "server", "shared", "ui"]
 resolver = "2"
 
 [workspace.package]
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 license = "MIT"
 authors = ["ABD <cryogenicdeadfrost>"]
@@ -12,6 +12,8 @@ authors = ["ABD <cryogenicdeadfrost>"]
 anyhow = "1"
 clap = { version = "4.5", features = ["derive"] }
 cpal = "0.18"
+eframe = "0.37.0"
+flexaudio = "0.8.1"
 rusty-opus = "1.0"
 
 [profile.release]
