@@ -174,11 +174,11 @@ impl SonicBridgeApp {
 }
 
 impl eframe::App for SonicBridgeApp {
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.refresh_process();
-        ctx.request_repaint_after(Duration::from_millis(500));
+        ui.ctx().request_repaint_after(Duration::from_millis(500));
 
-        egui::TopBottomPanel::top("top").show(ctx, |ui| {
+        egui::Panel::top("top").show(ui, |ui| {
             ui.horizontal(|ui| {
                 ui.heading("SonicBridge");
                 ui.label("PC → Pi → Bluetooth");
@@ -191,7 +191,7 @@ impl eframe::App for SonicBridgeApp {
             });
         });
 
-        egui::CentralPanel::default().show(ctx, |ui| {
+        egui::CentralPanel::default().show(ui, |ui| {
             ui.add_space(8.0);
             ui.heading("Node control");
             ui.label(
@@ -221,7 +221,7 @@ impl eframe::App for SonicBridgeApp {
                         ui.label("Opus bitrate");
                         ui.add(
                             egui::Slider::new(&mut self.bitrate, 32_000..=192_000)
-                                .step_by(8_000),
+                                .step_by(8_000.0),
                         );
                     });
                     ui.horizontal(|ui| {
@@ -245,7 +245,7 @@ impl eframe::App for SonicBridgeApp {
                         ui.label("Jitter buffer");
                         ui.add(
                             egui::Slider::new(&mut self.jitter_ms, 20..=300)
-                                .step_by(20),
+                                .step_by(20.0),
                         );
                     });
                     ui.checkbox(
