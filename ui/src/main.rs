@@ -1,4 +1,5 @@
 use eframe::egui;
+use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
@@ -50,8 +51,8 @@ impl SonicBridgeApp {
         }
     }
 
-    fn executable(&self) -> &'static str {
-        if cfg!(windows) {
+    fn executable(&self) -> PathBuf {
+        let name = if cfg!(windows) {
             match self.role {
                 Role::Client => "sonic-bridge-client.exe",
                 Role::Receiver | Role::Relay => "sonic-bridge-server.exe",
@@ -61,7 +62,36 @@ impl SonicBridgeApp {
                 Role::Client => "sonic-bridge-client",
                 Role::Receiver | Role::Relay => "sonic-bridge-server",
             }
+        };
+
+        if let Ok(dir) = std::env::var("SONIC_BRIDGE_BIN_DIR") {
+            return PathBuf::from(dir).join(name);
         }
+
+        let exe_dir = std::env::current_exe()
+            .ok()
+            .and_then(|path| path.parent().map(PathBuf::from));
+
+        if let Some(dir) = exe_dir {
+            let beside_ui = dir.join(name);
+            if beside_ui.exists() {
+                return beside_ui;
+            }
+
+            let target_release = dir.join("target").join("release").join(name);
+            if target_release.exists() {
+                return target_release;
+            }
+
+            if let Some(parent) = dir.parent() {
+                let target_release = parent.join("target").join("release").join(name);
+                if target_release.exists() {
+                    return target_release;
+                }
+            }
+        }
+
+        PathBuf::from(name)
     }
 
     fn start(&mut self) {
@@ -69,7 +99,8 @@ impl SonicBridgeApp {
             return;
         }
 
-        let mut command = Command::new(self.executable());
+        let executable = self.executable();
+        let mut command = Command::new(&executable);
 
         match self.role {
             Role::Client => {
@@ -107,7 +138,7 @@ impl SonicBridgeApp {
                 self.status = format!("Running {}", self.role.label());
             }
             Err(error) => {
-                self.status = format!("Could not start {}: {error}", self.executable());
+                self.status = format!("Could not start {}: {error}", executable.display());
             }
         }
     }
@@ -155,7 +186,7 @@ impl eframe::App for SonicBridgeApp {
         egui::CentralPanel::default().show(ctx, |ui| {
             ui.add_space(8.0);
             ui.heading("Node control");
-            ui.label("The GUI is only the steering wheel. The audio engine remains the small CLI daemon.");
+            ui.label("The GUI is the steering wheel. The audio engine remains the small CLI daemon.");
 
             ui.horizontal(|ui| {
                 ui.label("Role");
@@ -184,7 +215,7 @@ impl eframe::App for SonicBridgeApp {
                         ui.label("Packet TTL");
                         ui.add(egui::Slider::new(&mut self.ttl, 1..=32));
                     });
-                    ui.small("System audio capture uses the native OS loopback backend.");
+                    ui.small("System audio capture uses native Windows WASAPI loopback through flexaudio.");
                 }
                 Role::Receiver | Role::Relay => {
                     ui.horizontal(|ui| {
@@ -230,15 +261,16 @@ impl eframe::App for SonicBridgeApp {
             }
 
             ui.separator();
-            ui.collapsing("Bluetooth / Linux notes", |ui| {
-                ui.label("Bluetooth pairing and A2DP routing remain owned by BlueZ + PipeWire.");
-                ui.label("Use the normal Linux audio sink for the final hop.");
-                ui.label("The daemon does not touch raw Bluetooth packets.");
+            ui.collapsing("Bluetooth / Linux", |ui| {
+                ui.label("BlueZ owns Bluetooth pairing and A2DP.");
+                ui.label("PipeWire owns the audio graph and final Bluetooth sink.");
+                ui.label("SonicBridge only moves PCM-compressed audio between nodes.");
             });
 
             ui.collapsing("Chain example", |ui| {
                 ui.monospace("PC -> Pi #1 -> Pi #2 -> Pi #3 -> earbuds");
-                ui.label("Each Pi runs the same server binary. Give each relay a --forward-to address.");
+                ui.label("Every Pi runs the same server binary. Set --forward-to on each relay.");
+                ui.label("TTL prevents an accidental relay loop from becoming a distributed noise machine.");
             });
         });
     }
