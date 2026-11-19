@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
 use clap::Parser;
-use flexaudio::{open, OutputFormat, SourceKind, StreamConfig};
+use flexaudio::{OutputFormat, SourceKind, StreamConfig, open};
 use rusty_opus::{Application, OpusEncoder};
 use sonic_bridge_shared::{CHANNELS, FRAME_MS, FRAME_SAMPLES, PacketHeader, SAMPLE_RATE};
 use std::{net::UdpSocket, thread, time::Duration};
@@ -42,7 +42,9 @@ fn main() -> Result<()> {
     })
     .context("could not initialise system-audio loopback")?;
 
-    stream.start().context("could not start system-audio capture")?;
+    stream
+        .start()
+        .context("could not start system-audio capture")?;
 
     let socket = UdpSocket::bind("0.0.0.0:0")
         .context("could not create the SonicBridge UDP socket")?;
@@ -51,9 +53,8 @@ fn main() -> Result<()> {
         .connect(&args.target)
         .with_context(|| format!("could not connect to {}", args.target))?;
 
-    let mut encoder =
-        OpusEncoder::new(SAMPLE_RATE as i32, CHANNELS as usize, Application::Audio)
-            .context("could not initialise Opus")?;
+    let mut encoder = OpusEncoder::new(SAMPLE_RATE as i32, CHANNELS as usize, Application::Audio)
+        .context("could not initialise Opus")?;
 
     encoder.bitrate_bps = args.bitrate as i32;
     encoder.complexity = 5;
