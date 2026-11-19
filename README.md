@@ -2,313 +2,368 @@
 
 > Your PC makes the noise. The Raspberry Pi gets the Bluetooth job.
 
-SonicBridge is a tiny Rust audio relay for the slightly ridiculous problem of wanting your Windows PC to play audio through Bluetooth headphones that are paired to a Raspberry Pi.
+SonicBridge is a small Rust audio relay for the slightly ridiculous problem of wanting a Windows PC to play through Bluetooth headphones or speakers attached to a Raspberry Pi.
 
-It has two jobs:
+Version 0.2 keeps the original idea, but turns it into an actual platform:
 
-1. **Windows client** captures the audio being played by Windows.
-2. **Linux/Pi server** receives that audio and hands it to the Pi's normal audio stack.
+- CLI-first daemons for unattended machines
+- a native Rust GUI for humans who would rather click a button
+- native system-audio loopback capture
+- Opus over UDP
+- configurable jitter buffering
+- multi-Pi forwarding
+- TTL protection against relay loops
+- one receiver binary that can be a player, relay, or both
 
-So the Pi becomes a Bluetooth middleman instead of a very expensive paperweight.
+The core remains deliberately boring. That is a compliment.
 
-## The idea
+## The architecture
 
-~~~text
-             LAN / Tailscale
-Windows PC                         Raspberry Pi
-┌─────────────────┐              ┌──────────────────┐
-│ Windows audio   │              │ SonicBridge      │
-│       │         │              │      │           │
-│ WASAPI loopback │── Opus/UDP ─▶│ Opus decoder     │
-│       │         │              │      │           │
-│ Opus encoder    │              │ PipeWire / ALSA  │
-└─────────────────┘              │      │           │
-                                 │ Bluetooth A2DP   │
-                                 └──────┼───────────┘
-                                        ▼
-                                  OnePlus Buds
-                                  or any BT sink
-~~~
+    Windows PC
+    ┌──────────────────────┐
+    │ SonicBridge Client   │
+    │ native system audio  │
+    │ loopback             │
+    └──────────┬───────────┘
+               │ Opus / UDP
+               ▼
+    ┌──────────────────────┐
+    │ Raspberry Pi #1      │
+    │ receiver + relay     │
+    └──────────┬───────────┘
+               │ Opus / UDP
+               ▼
+    ┌──────────────────────┐
+    │ Raspberry Pi #2      │
+    │ receiver + relay     │
+    └──────────┬───────────┘
+               │
+               ▼
+    ┌──────────────────────┐
+    │ Raspberry Pi #3      │
+    │ receiver             │
+    │ PipeWire             │
+    │       │              │
+    │       ▼              │
+    │ Bluetooth A2DP       │
+    └───────┬──────────────┘
+            ▼
+       OnePlus Buds
+       / speaker
 
-We do **not** intercept Bluetooth packets on Windows. That would be an unnecessarily painful way to reinvent half of the Bluetooth stack.
+The Pi does not magically increase the electrical volume of the original signal. It acts as a networked audio middleman and can retransmit the stream to another node.
 
-Windows already has the decoded audio. We grab that, compress it, send it over the network, and let Linux handle Bluetooth.
+That distinction matters. Otherwise we would be selling networking as a power amplifier.
 
 ## Why Rust?
 
-Because this thing is supposed to sit in the background and behave itself.
+The entire application remains Rust.
 
-Rust gives SonicBridge:
+The GUI uses egui/eframe, giving us a native desktop interface without dragging a browser runtime behind it.
 
-- a small native executable
-- predictable memory usage
-- no garbage collector
-- bounded queues
-- easy Linux + Windows deployment
-- very little runtime baggage
+The audio path uses flexaudio for system-output capture. It provides a Rust API for system loopback on Windows through WASAPI and Linux through PipeWire, while normalizing captured audio into a predictable stream.
 
-In other words: it should consume less RAM than the browser tab you forgot was open.
+Bluetooth itself is intentionally left to the operating system:
 
-## Current design
+    SonicBridge
+         │
+         ▼
+      PipeWire
+         │
+         ▼
+        BlueZ
+         │
+         ▼
+    Bluetooth A2DP
+         │
+         ▼
+    Earbuds / speaker
 
-The first release intentionally keeps the protocol boring.
+That is the sane division of labour. SonicBridge transports audio. PipeWire manages the audio graph. BlueZ manages Linux Bluetooth.
 
-- 48 kHz
-- stereo
-- 20 ms audio frames
-- Opus compression
-- UDP transport
-- sequence numbers
-- Opus packet-loss concealment
-- bounded queues
-- Windows logon startup
-- Raspberry Pi systemd startup
+For Linux Bluetooth control and discovery, the project can later expose BlueZ through D-Bus without making the actual audio transport depend on raw Bluetooth packet handling.
 
-The audio path is:
+## CLI and GUI are both first-class
 
-~~~text
-Windows audio
+The CLI is for machines.
+
+    sonic-bridge-client --target 100.64.0.10:8765
+
+    sonic-bridge-server --listen 0.0.0.0:8765
+
+The GUI is for humans.
+
+    cargo run --release -p sonic-bridge-ui
+
+The GUI exposes the settings that actually matter:
+
+- client target
+- Opus bitrate
+- packet TTL
+- receiver listen address
+- next relay
+- jitter-buffer size
+- relay-only mode
+
+The GUI does not replace the daemon. It controls it.
+
+That keeps the Pi installation tiny while still giving a desktop user an easy control surface.
+
+## Multi-Pi chaining
+
+Every Pi runs the same receiver binary.
+
+A simple chain looks like:
+
+    PC
      │
      ▼
-WASAPI loopback
+    Pi #1
      │
      ▼
-20 ms PCM frame
+    Pi #2
      │
      ▼
-Opus
+    Pi #3
      │
      ▼
-UDP packet
-     │
-     ▼
-Raspberry Pi
-     │
-     ▼
-Opus
-     │
-     ▼
-PipeWire / ALSA
-     │
-     ▼
-Bluetooth
-~~~
+    Bluetooth sink
 
-UDP is intentional. If packet 417 disappears, we would rather lose roughly 20 ms of audio than wait around for packet 417 like it owes us money.
+Pi #1:
 
-## Repository
+    sonic-bridge-server       --listen 0.0.0.0:8765       --forward-to 100.64.0.11:8765       --relay-only
 
-~~~text
-Sonic_Bridge/
-├── client/                  # Windows sender
-│   └── src/main.rs
-├── server/                  # Linux / Raspberry Pi receiver
-│   └── src/main.rs
-├── shared/                  # Packet format + audio constants
-│   └── src/lib.rs
-├── scripts/
-│   ├── install-pi.sh
-│   └── install-windows.ps1
-├── Cargo.toml
-├── README.md
-├── LICENSE
-└── .gitignore
-~~~
+Pi #2:
+
+    sonic-bridge-server       --listen 0.0.0.0:8765       --forward-to 100.64.0.12:8765       --relay-only
+
+Pi #3:
+
+    sonic-bridge-server       --listen 0.0.0.0:8765
+
+The client sends to Pi #1.
+
+Each relay decrements the packet TTL. If the TTL reaches zero, the packet is not forwarded.
+
+This is deliberately primitive. Primitive is good when the alternative is debugging a five-node audio feedback loop at 2 AM.
+
+## Packet format
+
+Version 0.2 keeps the same 18-byte header shape but gives the previous reserved byte a real job.
+
+    magic(4)
+    version(1)
+    channels(1)
+    frame_ms(1)
+    ttl(1)
+    sequence(4)
+    sample_rate(4)
+    payload_len(2)
+    payload(...)
+
+Audio remains:
+
+    48 kHz
+    stereo
+    20 ms
+    960 frames/channel
+    Opus
+
+The packet sequence number lets the receiver detect gaps.
+
+The TTL lets multiple SonicBridge nodes forward packets without creating immortal traffic.
+
+## Jitter buffering
+
+The first version delivered packets almost immediately.
+
+That is nice until Wi-Fi decides that packet 381 should take the scenic route.
+
+Version 0.2 adds a small configurable packet-depth jitter buffer. The default is 60 ms.
+
+The receiver can trade latency for resilience:
+
+    sonic-bridge-server --jitter-ms 20
+
+or:
+
+    sonic-bridge-server --jitter-ms 120
+
+For a stable LAN, keep it small.
+
+For a noisy wireless/Tailscale path, give the receiver some breathing room.
+
+## Windows capture
+
+The client now uses the native system-output capture path exposed through flexaudio.
+
+That is important because the original implementation treated CPAL's normal input-device API as if it automatically meant WASAPI loopback. It was a clever assumption. It was also the sort of assumption that eventually bites you.
+
+Version 0.2 explicitly asks for system-output capture.
+
+The resulting pipeline is:
+
+    Windows system audio
+            │
+            ▼
+    native loopback
+            │
+            ▼
+    48 kHz stereo f32
+            │
+            ▼
+    20 ms frame
+            │
+            ▼
+    Opus
+            │
+            ▼
+    UDP
+
+## Raspberry Pi audio
+
+The Pi does not need to understand Bluetooth packets.
+
+Pair the earbuds normally using BlueZ and select the Bluetooth A2DP sink through PipeWire.
+
+For example:
+
+    wpctl status
+    wpctl set-default <bluetooth-sink-id>
+
+SonicBridge then writes decoded PCM into the normal Linux audio output path.
 
 ## Build
 
-You need a reasonably recent Rust toolchain.
+Install a current Rust toolchain.
 
-### Windows
+Build everything:
 
-Build the client:
+    cargo build --release
 
-~~~powershell
-cargo build --release -p sonic-bridge-client
-~~~
+Build only the Windows client:
 
-Run it:
+    cargo build --release -p sonic-bridge-client
 
-~~~powershell
-.\target\release\sonic-bridge-client.exe --target 192.168.1.50:8765
-~~~
+Build the Pi receiver:
 
-Replace the address with the Raspberry Pi address.
+    cargo build --release -p sonic-bridge-server
 
-If the Pi is reachable through Tailscale, use its Tailscale address instead. SonicBridge doesn't particularly care how the packets get there. It just wants them to arrive.
+Build the GUI:
 
-### Raspberry Pi / Linux
+    cargo build --release -p sonic-bridge-ui
 
-Build the server:
+## Persistent Pi installation
 
-~~~bash
-cargo build --release -p sonic-bridge-server
-~~~
+The existing installer can install the receiver as a systemd service.
 
-Run it:
+    chmod +x scripts/install-pi.sh
+    ./scripts/install-pi.sh ./target/release/sonic-bridge-server
 
-~~~bash
-./target/release/sonic-bridge-server --listen 0.0.0.0:8765
-~~~
+For a relay, configure the service with the forwarding options shown above.
 
-The Pi should have its Bluetooth headphones paired and selected as the normal Linux audio output.
+The service is designed to restart after failure and start after networking and the audio/Bluetooth stack are available.
 
-On PipeWire systems:
+## Persistent Windows installation
 
-~~~bash
-wpctl status
-wpctl set-default <bluetooth-sink-id>
-~~~
+    Set-ExecutionPolicy -Scope Process Bypass
+    .\scripts\install-windows.ps1 -Target 100.64.0.10:8765
 
-Then SonicBridge writes into that normal output path.
+The current installer uses a Windows Scheduled Task at logon.
 
-## Make it persistent
+The next step is a proper tray/service split so the GUI can remain separate from the persistent audio worker.
 
-### Raspberry Pi
+## Tailscale
 
-Install the receiver as a systemd service:
+SonicBridge works fine over Tailscale.
 
-~~~bash
-chmod +x scripts/install-pi.sh
-./scripts/install-pi.sh ./target/release/sonic-bridge-server
-~~~
+    University PC
+          │
+          │ Tailscale
+          ▼
+    Home Pi #1
+          │
+          ▼
+    Home Pi #2
+          │
+          ▼
+    Bluetooth
 
-It will restart if the process crashes.
+Use the Pi's Tailscale address as the client target.
 
-### Windows
+Do not expose UDP 8765 directly to the public Internet.
 
-Install the client as a Windows Scheduled Task:
+## Memory philosophy
 
-~~~powershell
-Set-ExecutionPolicy -Scope Process Bypass
-.\scripts\install-windows.ps1 -Target 192.168.1.50:8765
-~~~
-
-Now the client starts at logon instead of requiring you to remember that this tiny audio goblin exists.
-
-## Remote mode with Tailscale
-
-If your PC and Pi are on different networks but both are connected through Tailscale:
-
-~~~text
-University / wherever
-
-Windows PC
-    │
-    │ Tailscale
-    ▼
-Raspberry Pi at home
-    │
-    │ Bluetooth
-    ▼
-Earbuds
-~~~
-
-Run the Windows client against the Pi's Tailscale address:
-
-~~~powershell
-sonic-bridge-client.exe --target <pi-tailscale-ip>:8765
-~~~
-
-Do **not** expose port 8765 directly to the public Internet.
-
-## Memory and latency
-
-The design uses fixed-size audio frames and bounded channels.
+The system is intentionally hostile to runaway buffering.
 
 There is no:
 
 - database
 - media library
-- GUI framework
 - browser runtime
-- unbounded audio queue
-- "let's just store everything in a Vec and see what happens" philosophy
+- unbounded queue
+- giant audio history
+- "we'll clean it up later" allocator
 
-The intended steady-state memory footprint is small, although the exact number depends on the Rust allocator, CPAL backend, PipeWire/ALSA stack, and OS.
+Audio is processed in small fixed-duration chunks.
 
-The current version favours simplicity over ultra-low latency. The next serious step is a proper jitter buffer with measured latency and packet-loss statistics.
+Queues are bounded.
 
-## Security
+Old audio is disposable.
 
-The first protocol is designed for a trusted private network.
+If the network is behind, the system should lose audio rather than slowly transform a 20 ms delay into a 20 second delay.
 
-SonicBridge currently provides transport integrity through the surrounding private network rather than pretending that a bare UDP listener is an authentication system.
+## Current roadmap
 
-For remote use, Tailscale is strongly preferred.
+### 0.2
 
-Future versions can add authenticated encryption at the packet layer.
+- [x] Native Rust GUI
+- [x] Windows system-output loopback through flexaudio
+- [x] Opus transport
+- [x] Configurable jitter buffer
+- [x] Multi-Pi forwarding
+- [x] TTL loop protection
+- [x] CLI + GUI control paths
+- [x] Relay-only mode
 
-## Troubleshooting
+### 0.3
 
-### No sound on the Pi
+- [ ] BlueZ device discovery in the GUI
+- [ ] Automatic PipeWire Bluetooth sink selection
+- [ ] Authenticated packet encryption
+- [ ] Latency and packet-loss dashboard
+- [ ] Automatic reconnect state machine
+- [ ] Persistent TOML configuration
+- [ ] GUI-managed chain topology
+- [ ] Per-node health checks
+- [ ] Better Windows startup/service integration
 
-Check the normal Linux output first:
+### 0.4
 
-~~~bash
-wpctl status
-~~~
-
-Then make sure the Bluetooth device is the default sink.
-
-### Client says the format is unsupported
-
-The first release expects:
-
-~~~text
-48,000 Hz
-2 channels
-~~~
-
-If your Windows endpoint is running at another rate, change the Windows output format or use a compatible endpoint.
-
-### Audio cuts out
-
-Check the network first.
-
-For Tailscale:
-
-~~~bash
-tailscale ping <pi>
-~~~
-
-Also remember that UDP intentionally does not retransmit old audio.
-
-### High latency
-
-Congratulations, you've discovered the part where networking meets audio engineering.
-
-The current version uses 20 ms frames and bounded buffering. A future jitter-buffer implementation will make this much easier to tune.
-
-## Roadmap
-
-- [x] Windows system-audio capture
-- [x] Opus audio encoding
-- [x] UDP transport
-- [x] Raspberry Pi/Linux receiver
-- [x] Sequence numbers
-- [x] Packet-loss concealment
-- [x] Windows startup task
-- [x] systemd receiver
-- [ ] Automatic device selection
-- [ ] Config file
-- [ ] Authentication / encryption
-- [ ] Jitter buffer
-- [ ] Latency statistics
-- [ ] Reconnect state machine
-- [ ] Windows tray/status app
-- [ ] Better device discovery
-- [ ] Cross-platform client support
+- [ ] Adaptive jitter buffering
+- [ ] Forward-error correction experiments
+- [ ] Multiple source clients
+- [ ] Synchronised multi-speaker output
+- [ ] Audio gain/DSP controls
+- [ ] Remote node management
+- [ ] Optional WebSocket control plane
 
 ## The important bit
 
-SonicBridge is deliberately not trying to become a media server, a Bluetooth stack, or a distributed Spotify clone.
+SonicBridge is still not trying to become a media server, Bluetooth stack, or distributed Spotify clone.
 
-It does one thing:
+It has a simpler job:
 
-**take the audio your computer is already playing and get it to a Bluetooth speaker/headset attached to another machine.**
+**take the audio your computer is already producing, move it across a network, let one or more Raspberry Pis relay it, and finally hand it to the Linux Bluetooth stack.**
 
-If it can do that quietly for months without demanding attention, we've won.
+The CLI keeps the system usable as a headless daemon.
+
+The GUI makes the same system usable by an actual human.
+
+Both talk to the same underlying audio pipeline.
+
+That is the platform.
 
 ## License
 

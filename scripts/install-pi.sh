@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-BIN="\${1:-./sonic-bridge-server}"
+BIN="${1:-./sonic-bridge-server}"
+shift || true
+
 INSTALL_DIR="/usr/local/bin"
 SERVICE="/etc/systemd/system/sonic-bridge.service"
 
@@ -12,7 +14,12 @@ fi
 
 sudo install -Dm755 "$BIN" "$INSTALL_DIR/sonic-bridge-server"
 
-sudo tee "$SERVICE" >/dev/null <<'UNIT'
+EXTRA_ARGS=""
+if [[ "$#" -gt 0 ]]; then
+    printf -v EXTRA_ARGS ' %q' "$@"
+fi
+
+sudo tee "$SERVICE" >/dev/null <<UNIT
 [Unit]
 Description=SonicBridge audio receiver
 After=network-online.target pipewire.service bluetooth.service
@@ -20,7 +27,7 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-ExecStart=/usr/local/bin/sonic-bridge-server --listen 0.0.0.0:8765
+ExecStart=/usr/local/bin/sonic-bridge-server --listen 0.0.0.0:8765${EXTRA_ARGS}
 Restart=always
 RestartSec=2
 NoNewPrivileges=true

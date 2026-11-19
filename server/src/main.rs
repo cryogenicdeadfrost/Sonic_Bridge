@@ -56,7 +56,9 @@ impl JitterBuffer {
 
         if let Some(next) = self.next_sequence {
             if sequence.wrapping_sub(next) < 0x8000_0000 {
-                self.packets.entry(sequence).or_insert_with(|| payload.to_vec());
+                self.packets
+                    .entry(sequence)
+                    .or_insert_with(|| payload.to_vec());
             }
         }
     }
@@ -101,7 +103,7 @@ fn main() -> Result<()> {
         )
     };
 
-    let (tx, stream) = if let Some(device) = device {
+    let (tx, _stream) = if let Some(device) = device {
         let config = device
             .default_output_config()
             .context("could not open the default Linux audio output")?;
@@ -128,7 +130,9 @@ fn main() -> Result<()> {
             other => anyhow::bail!("unsupported Linux sample format: {other:?}"),
         };
 
-        stream.play().context("could not start Linux audio playback")?;
+        stream
+            .play()
+            .context("could not start Linux audio playback")?;
         (Some(tx), Some(stream))
     } else {
         (None, None)
@@ -136,15 +140,15 @@ fn main() -> Result<()> {
 
     eprintln!("SonicBridge server v0.2");
     eprintln!("Listening on {}", args.listen);
-    eprintln!("Relay target: {}", args.forward_to.as_deref().unwrap_or("none"));
+    eprintln!(
+        "Relay target: {}",
+        args.forward_to.as_deref().unwrap_or("none")
+    );
     eprintln!("Relay only: {}", args.relay_only);
     eprintln!("Jitter buffer: {} ms", args.jitter_ms);
 
     let forward_socket = if args.forward_to.is_some() {
-        Some(
-            UdpSocket::bind("0.0.0.0:0")
-                .context("could not create relay UDP socket")?,
-        )
+        Some(UdpSocket::bind("0.0.0.0:0").context("could not create relay UDP socket")?)
     } else {
         None
     };
@@ -177,7 +181,7 @@ fn main() -> Result<()> {
                     std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
                 ) =>
             {
-                continue
+                continue;
             }
             Err(error) => return Err(error.into()),
         };
@@ -252,7 +256,7 @@ fn main() -> Result<()> {
 
     #[allow(unreachable_code)]
     {
-        drop(stream);
+        drop(_stream);
         Ok(())
     }
 }

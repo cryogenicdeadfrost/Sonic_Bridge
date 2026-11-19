@@ -11,7 +11,7 @@ authors = ["ABD <cryogenicdeadfrost>"]
 [workspace.dependencies]
 anyhow = "1"
 clap = { version = "4.5", features = ["derive"] }
-cpal = "0.18"
+cpal = "0.16.0"
 eframe = "0.37.0"
 flexaudio = "0.8.1"
 rusty-opus = "1.0"
