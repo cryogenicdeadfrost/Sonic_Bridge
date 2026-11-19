@@ -46,8 +46,8 @@ fn main() -> Result<()> {
         .start()
         .context("could not start system-audio capture")?;
 
-    let socket = UdpSocket::bind("0.0.0.0:0")
-        .context("could not create the SonicBridge UDP socket")?;
+    let socket =
+        UdpSocket::bind("0.0.0.0:0").context("could not create the SonicBridge UDP socket")?;
 
     socket
         .connect(&args.target)
