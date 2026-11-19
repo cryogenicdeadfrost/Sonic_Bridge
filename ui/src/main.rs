@@ -131,7 +131,11 @@ impl SonicBridgeApp {
             }
         }
 
-        match command.stdout(Stdio::inherit()).stderr(Stdio::inherit()).spawn() {
+        match command
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::inherit())
+            .spawn()
+        {
             Ok(child) => {
                 self.process = Some(child);
                 self.started_at = Some(Instant::now());
@@ -179,14 +183,20 @@ impl eframe::App for SonicBridgeApp {
                 ui.heading("SonicBridge");
                 ui.label("PC → Pi → Bluetooth");
                 ui.separator();
-                ui.label(if self.process.is_some() { "● RUNNING" } else { "○ STOPPED" });
+                ui.label(if self.process.is_some() {
+                    "● RUNNING"
+                } else {
+                    "○ STOPPED"
+                });
             });
         });
 
         egui::CentralPanel::default().show(ctx, |ui| {
             ui.add_space(8.0);
             ui.heading("Node control");
-            ui.label("The GUI is the steering wheel. The audio engine remains the small CLI daemon.");
+            ui.label(
+                "The GUI is the steering wheel. The audio engine remains the small CLI daemon.",
+            );
 
             ui.horizontal(|ui| {
                 ui.label("Role");
@@ -209,13 +219,18 @@ impl eframe::App for SonicBridgeApp {
                     });
                     ui.horizontal(|ui| {
                         ui.label("Opus bitrate");
-                        ui.add(egui::Slider::new(&mut self.bitrate, 32_000..=192_000).step_by(8_000));
+                        ui.add(
+                            egui::Slider::new(&mut self.bitrate, 32_000..=192_000)
+                                .step_by(8_000),
+                        );
                     });
                     ui.horizontal(|ui| {
                         ui.label("Packet TTL");
                         ui.add(egui::Slider::new(&mut self.ttl, 1..=32));
                     });
-                    ui.small("System audio capture uses native Windows WASAPI loopback through flexaudio.");
+                    ui.small(
+                        "System audio capture uses native Windows WASAPI loopback through flexaudio.",
+                    );
                 }
                 Role::Receiver | Role::Relay => {
                     ui.horizontal(|ui| {
@@ -228,10 +243,18 @@ impl eframe::App for SonicBridgeApp {
                     });
                     ui.horizontal(|ui| {
                         ui.label("Jitter buffer");
-                        ui.add(egui::Slider::new(&mut self.jitter_ms, 20..=300).step_by(20));
+                        ui.add(
+                            egui::Slider::new(&mut self.jitter_ms, 20..=300)
+                                .step_by(20),
+                        );
                     });
-                    ui.checkbox(&mut self.relay_only, "Relay only (do not play locally)");
-                    ui.small("A relay can forward audio to another Pi while optionally playing it locally.");
+                    ui.checkbox(
+                        &mut self.relay_only,
+                        "Relay only (do not play locally)",
+                    );
+                    ui.small(
+                        "A relay can forward audio to another Pi while optionally playing it locally.",
+                    );
                 }
             }
 
@@ -269,8 +292,12 @@ impl eframe::App for SonicBridgeApp {
 
             ui.collapsing("Chain example", |ui| {
                 ui.monospace("PC -> Pi #1 -> Pi #2 -> Pi #3 -> earbuds");
-                ui.label("Every Pi runs the same server binary. Set --forward-to on each relay.");
-                ui.label("TTL prevents an accidental relay loop from becoming a distributed noise machine.");
+                ui.label(
+                    "Every Pi runs the same server binary. Set --forward-to on each relay.",
+                );
+                ui.label(
+                    "TTL prevents an accidental relay loop from becoming a distributed noise machine.",
+                );
             });
         });
     }
