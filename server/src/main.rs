@@ -103,7 +103,7 @@ fn main() -> Result<()> {
         )
     };
 
-    let (tx, stream) = if let Some(device) = device {
+    let (tx, _stream) = if let Some(device) = device {
         let config = device
             .default_output_config()
             .context("could not open the default Linux audio output")?;
@@ -256,7 +256,7 @@ fn main() -> Result<()> {
 
     #[allow(unreachable_code)]
     {
-        drop(stream);
+        drop(_stream);
         Ok(())
     }
 }
