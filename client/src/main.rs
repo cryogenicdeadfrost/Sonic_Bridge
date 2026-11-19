@@ -33,7 +33,7 @@ fn main() -> Result<()> {
     eprintln!("Packet TTL: {}", args.ttl);
 
     let mut stream = open(StreamConfig {
-        kind: SourceKind::System,
+        kind: SourceKind::SystemLoopback,
         output: OutputFormat {
             sample_rate: SAMPLE_RATE,
             channels: CHANNELS as u16,
