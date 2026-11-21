@@ -1,4 +1,4 @@
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use clap::Parser;
 use flexaudio::{OutputFormat, SourceKind, StreamConfig, open};
 use rusty_opus::{Application, OpusEncoder};
@@ -6,25 +6,40 @@ use sonic_bridge_shared::{
     CHANNELS, FLAG_ENCRYPTED, FRAME_MS, FRAME_SAMPLES, NONCE_LEN, PacketHeader, SAMPLE_RATE,
     encrypt_payload, fresh_nonce, parse_key_hex,
 };
-use std::{net::UdpSocket, thread, time::Duration};
+use std::{
+    net::UdpSocket,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+    thread,
+    time::{Duration, Instant},
+};
+
+const MAX_OPUS_FRAME_BYTES: usize = 1_275;
 
 #[derive(Parser, Debug)]
 #[command(
     name = "sonic-bridge-client",
-    about = "Send Windows system audio to a SonicBridge receiver"
+    version,
+    about = "Send system audio to a SonicBridge receiver"
 )]
 struct Args {
     /// Address of the Raspberry Pi receiver or next relay.
-    #[arg(long, default_value = "127.0.0.1:8765")]
+    #[arg(long, env = "SONIC_BRIDGE_TARGET", default_value = "127.0.0.1:8765")]
     target: String,
 
-    /// Opus bitrate in bits per second.
+    /// Opus bitrate in bits per second (6,000..=512,000).
     #[arg(long, default_value_t = 96_000)]
     bitrate: u32,
 
-    /// Maximum number of relay hops before the packet is discarded.
+    /// Maximum number of relay hops before the packet is discarded (1..=32).
     #[arg(long, default_value_t = 8)]
     ttl: u8,
+
+    /// Print a transmission summary every N seconds. Set to 0 to disable.
+    #[arg(long, default_value_t = 5)]
+    stats_interval: u64,
 
     /// Optional 256-bit key as 64 hexadecimal characters.
     #[arg(long, env = "SONIC_BRIDGE_KEY")]
@@ -34,10 +49,22 @@ struct Args {
 fn main() -> Result<()> {
     let args = Args::parse();
 
-    eprintln!("SonicBridge client v0.3");
-    eprintln!("Target: {}", args.target);
-    eprintln!("Bitrate: {} bps", args.bitrate);
-    eprintln!("Packet TTL: {}", args.ttl);
+    if !(6_000..=512_000).contains(&args.bitrate) {
+        bail!("--bitrate must be between 6000 and 512000 bits per second");
+    }
+    if !(1..=32).contains(&args.ttl) {
+        bail!("--ttl must be between 1 and 32");
+    }
+    if args.target.trim().is_empty() {
+        bail!("--target cannot be empty");
+    }
+
+    let key = args
+        .key_hex
+        .as_deref()
+        .map(parse_key_hex)
+        .transpose()
+        .context("invalid SonicBridge encryption key")?;
 
     let mut stream = open(StreamConfig {
         kind: SourceKind::SystemLoopback,
@@ -62,79 +89,119 @@ fn main() -> Result<()> {
 
     let mut encoder = OpusEncoder::new(SAMPLE_RATE as i32, CHANNELS as usize, Application::Audio)
         .context("could not initialise Opus")?;
-
     encoder.bitrate_bps = args.bitrate as i32;
     encoder.complexity = 5;
     encoder.use_cbr = false;
     encoder.use_dtx = true;
 
-    let key = args
-        .key_hex
-        .as_deref()
-        .map(parse_key_hex)
-        .transpose()
-        .context("invalid SonicBridge encryption key")?;
+    let running = Arc::new(AtomicBool::new(true));
+    let stop_flag = Arc::clone(&running);
+    ctrlc::set_handler(move || stop_flag.store(false, Ordering::Relaxed))
+        .context("could not install Ctrl+C handler")?;
 
-    if key.is_some() {
-        eprintln!("Audio encryption: XChaCha20-Poly1305");
-    } else {
-        eprintln!("Audio encryption: disabled");
-    }
+    eprintln!("SonicBridge client v{}", env!("CARGO_PKG_VERSION"));
+    eprintln!("Target: {}", args.target);
+    eprintln!("Bitrate: {} bps", args.bitrate);
+    eprintln!("Packet TTL: {}", args.ttl);
+    eprintln!(
+        "Audio encryption: {}",
+        if key.is_some() { "XChaCha20-Poly1305" } else { "disabled" }
+    );
+    eprintln!("Press Ctrl+C to stop.");
 
     let mut sequence = 0u32;
-    let mut encoded = [0u8; 1200];
-    let mut packet = Vec::with_capacity(1300);
-    let expected_samples = FRAME_SAMPLES * CHANNELS as usize;
+    let mut sent = 0u64;
+    let mut frame = [0.0f32; FRAME_SAMPLES * CHANNELS as usize];
+    let mut filled = 0usize;
+    let mut encoded = [0u8; MAX_OPUS_FRAME_BYTES];
+    let mut packet = Vec::with_capacity(1_350);
+    let mut last_report = Instant::now();
 
-    loop {
-        let chunk = match stream.poll_chunk() {
-            Some(chunk) => chunk,
-            None => {
-                thread::sleep(Duration::from_millis(1));
-                continue;
-            }
+    while running.load(Ordering::Relaxed) {
+        let Some(chunk) = stream.poll_chunk() else {
+            thread::sleep(Duration::from_millis(1));
+            continue;
         };
 
-        if chunk.data.len() != expected_samples {
-            continue;
+        // Capture backends are free to hand us oddly-sized chunks. Opus isn't.
+        let mut offset = 0usize;
+        while offset < chunk.data.len() {
+            let take = (frame.len() - filled).min(chunk.data.len() - offset);
+            frame[filled..filled + take].copy_from_slice(&chunk.data[offset..offset + take]);
+            filled += take;
+            offset += take;
+
+            if filled == frame.len() {
+                ship_frame(
+                    &mut encoder,
+                    &frame,
+                    key.as_ref(),
+                    args.ttl,
+                    sequence,
+                    &mut encoded,
+                    &mut packet,
+                    &socket,
+                )?;
+                sequence = sequence.wrapping_add(1);
+                sent += 1;
+                filled = 0;
+            }
         }
 
-        let encoded_len = encoder
-            .encode(&chunk.data, FRAME_SAMPLES, &mut encoded)
-            .context("Opus encoding failed")?;
-
-        packet.clear();
-
-        if let Some(key) = key.as_ref() {
-            let header = PacketHeader {
-                sequence,
-                sample_rate: SAMPLE_RATE,
-                channels: CHANNELS,
-                frame_ms: FRAME_MS,
-                ttl: args.ttl,
-                flags: FLAG_ENCRYPTED,
-                nonce: fresh_nonce(),
-            };
-            let ciphertext = encrypt_payload(key, &header, &encoded[..encoded_len])
-                .context("could not encrypt audio frame")?;
-            header.encode(&ciphertext, &mut packet);
-        } else {
-            let header = PacketHeader {
-                sequence,
-                sample_rate: SAMPLE_RATE,
-                channels: CHANNELS,
-                frame_ms: FRAME_MS,
-                ttl: args.ttl,
-                flags: 0,
-                nonce: [0u8; NONCE_LEN],
-            };
-            header.encode(&encoded[..encoded_len], &mut packet);
+        if args.stats_interval > 0
+            && last_report.elapsed() >= Duration::from_secs(args.stats_interval)
+        {
+            eprintln!("stats: sent={sent} packets");
+            last_report = Instant::now();
         }
-
-        socket
-            .send(&packet)
-            .context("could not send audio packet")?;
-
-        sequence = sequence.wrapping_add(1);
     }
+
+    eprintln!("Stopped. Sent {sent} audio packets.");
+    Ok(())
+}
+
+fn ship_frame(
+    encoder: &mut OpusEncoder,
+    frame: &[f32; FRAME_SAMPLES * CHANNELS as usize],
+    key: Option<&[u8; 32]>,
+    ttl: u8,
+    sequence: u32,
+    encoded: &mut [u8; MAX_OPUS_FRAME_BYTES],
+    packet: &mut Vec<u8>,
+    socket: &UdpSocket,
+) -> Result<()> {
+    let encoded_len = encoder
+        .encode(frame, FRAME_SAMPLES, encoded)
+        .context("Opus encoding failed")?;
+
+    if let Some(key) = key {
+        let header = PacketHeader {
+            sequence,
+            sample_rate: SAMPLE_RATE,
+            channels: CHANNELS,
+            frame_ms: FRAME_MS,
+            ttl,
+            flags: FLAG_ENCRYPTED,
+            nonce: fresh_nonce(),
+        };
+        let ciphertext = encrypt_payload(key, &header, &encoded[..encoded_len])
+            .context("could not encrypt audio frame")?;
+        header.encode(&ciphertext, packet);
+    } else {
+        let header = PacketHeader {
+            sequence,
+            sample_rate: SAMPLE_RATE,
+            channels: CHANNELS,
+            frame_ms: FRAME_MS,
+            ttl,
+            flags: 0,
+            nonce: [0u8; NONCE_LEN],
+        };
+        header.encode(&encoded[..encoded_len], packet);
+    }
+
+    socket
+        .send(packet)
+        .context("could not send audio packet")?;
+    Ok(())
 }
