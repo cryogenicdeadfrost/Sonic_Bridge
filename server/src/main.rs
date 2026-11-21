@@ -335,7 +335,6 @@ fn main() -> Result<()> {
     }
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -361,10 +360,7 @@ mod tests {
         assert!(buffer.insert(0, &[3]));
         assert!(buffer.insert(u32::MAX, &[2]));
 
-        assert_eq!(
-            buffer.pop_next().unwrap(),
-            (u32::MAX - 1, vec![1])
-        );
+        assert_eq!(buffer.pop_next().unwrap(), (u32::MAX - 1, vec![1]));
         assert_eq!(buffer.pop_next().unwrap(), (u32::MAX, vec![2]));
         assert_eq!(buffer.pop_next().unwrap(), (0, vec![3]));
     }
