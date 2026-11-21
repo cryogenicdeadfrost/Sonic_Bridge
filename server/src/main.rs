@@ -8,7 +8,7 @@ use sonic_bridge_shared::{
 };
 use std::{
     collections::BTreeMap,
-    net::UdpSocket,
+    net::{IpAddr, SocketAddr, UdpSocket},
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -24,15 +24,15 @@ use std::{
 )]
 struct Args {
     /// Address to listen on.
-    #[arg(long, default_value = "0.0.0.0:8765")]
+    #[arg(long, env = "SONIC_BRIDGE_LISTEN", default_value = "127.0.0.1:8765")]
     listen: String,
 
     /// Forward received packets to another SonicBridge node.
-    #[arg(long)]
+    #[arg(long, env = "SONIC_BRIDGE_FORWARD_TO")]
     forward_to: Option<String>,
 
     /// Do not play locally. Useful for a pure relay Pi.
-    #[arg(long, default_value_t = false)]
+    #[arg(long, env = "SONIC_BRIDGE_RELAY_ONLY", default_value_t = false)]
     relay_only: bool,
 
     /// Packet buffering before playback, in milliseconds.
@@ -46,6 +46,41 @@ struct Args {
     /// Print receiver statistics at this interval.
     #[arg(long, default_value_t = 5)]
     stats_interval: u64,
+
+    /// Only accept datagrams from these source IP addresses.
+    #[arg(long = "allowed-peer", env = "SONIC_BRIDGE_ALLOWED_PEERS", value_delimiter = ',')]
+    allowed_peers: Vec<IpAddr>,
+
+    /// Explicitly allow unencrypted traffic on a non-loopback interface.
+    #[arg(long, env = "SONIC_BRIDGE_ALLOW_INSECURE_LISTEN", default_value_t = false)]
+    allow_insecure_listen: bool,
+}
+
+fn validate_listener_policy(
+    listen_addr: SocketAddr,
+    has_key: bool,
+    relay_only: bool,
+    forwards_packets: bool,
+    has_allowed_peers: bool,
+    allow_insecure: bool,
+) -> Result<()> {
+    if listen_addr.ip().is_loopback() {
+        return Ok(());
+    }
+
+    if (relay_only || forwards_packets) && !has_allowed_peers && !allow_insecure {
+        anyhow::bail!(
+            "non-loopback relays and forwarding receivers need --allowed-peer; a blind forwarding path cannot validate a PSK"
+        );
+    }
+
+    if !has_key && !has_allowed_peers && !allow_insecure {
+        anyhow::bail!(
+            "refusing an unencrypted non-loopback listener; configure SONIC_BRIDGE_KEY, add --allowed-peer for trusted sender IPs, or explicitly pass --allow-insecure-listen"
+        );
+    }
+
+    Ok(())
 }
 
 struct JitterBuffer {
@@ -126,6 +161,21 @@ fn main() -> Result<()> {
         .transpose()
         .context("invalid SonicBridge encryption key")?;
 
+    let listen_addr: SocketAddr = args
+        .listen
+        .parse()
+        .context("--listen must be an IP address and port, for example 0.0.0.0:8765")?;
+    let exposed = !listen_addr.ip().is_loopback();
+    validate_listener_policy(
+        listen_addr,
+        key.is_some(),
+        args.relay_only,
+        args.forward_to.is_some(),
+        !args.allowed_peers.is_empty(),
+        args.allow_insecure_listen,
+    )
+    .context("unsafe receiver network configuration")?;
+
     let socket =
         UdpSocket::bind(&args.listen).context("could not bind the SonicBridge UDP socket")?;
 
@@ -187,6 +237,16 @@ fn main() -> Result<()> {
     );
     eprintln!("Relay only: {}", args.relay_only);
     eprintln!("Jitter buffer: {} ms", args.jitter_ms);
+    if !args.allowed_peers.is_empty() {
+        eprintln!("Allowed peers: {:?}", args.allowed_peers);
+    }
+    if exposed
+        && args.allowed_peers.is_empty()
+        && args.allow_insecure_listen
+        && (key.is_none() || args.relay_only || args.forward_to.is_some())
+    {
+        eprintln!("WARNING: accepting traffic on a non-loopback interface without a peer filter");
+    }
 
     let forward_socket = if args.forward_to.is_some() {
         Some(UdpSocket::bind("0.0.0.0:0").context("could not create relay UDP socket")?)
@@ -215,8 +275,8 @@ fn main() -> Result<()> {
     let mut last_report = Instant::now();
 
     while running.load(Ordering::Relaxed) {
-        let len = match socket.recv(&mut buf) {
-            Ok(len) => len,
+        let (len, peer) = match socket.recv_from(&mut buf) {
+            Ok(packet) => packet,
             Err(error)
                 if matches!(
                     error.kind(),
@@ -227,6 +287,11 @@ fn main() -> Result<()> {
             }
             Err(error) => return Err(error.into()),
         };
+
+        if !args.allowed_peers.is_empty() && !args.allowed_peers.contains(&peer.ip()) {
+            dropped += 1;
+            continue;
+        }
 
         let (header, payload) = match PacketHeader::decode(&buf[..len]) {
             Ok(packet) => packet,
@@ -347,6 +412,34 @@ fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn loopback_listener_needs_no_network_authentication() {
+        let addr = "127.0.0.1:8765".parse().unwrap();
+        assert!(validate_listener_policy(addr, false, false, false, false, false).is_ok());
+    }
+
+    #[test]
+    fn exposed_plaintext_listener_needs_an_explicit_boundary() {
+        let addr = "0.0.0.0:8765".parse().unwrap();
+        assert!(validate_listener_policy(addr, false, false, false, false, false).is_err());
+        assert!(validate_listener_policy(addr, false, false, false, true, false).is_ok());
+        assert!(validate_listener_policy(addr, false, false, false, false, true).is_ok());
+    }
+
+    #[test]
+    fn encrypted_final_receiver_can_listen_without_an_ip_filter() {
+        let addr = "0.0.0.0:8765".parse().unwrap();
+        assert!(validate_listener_policy(addr, true, false, false, false, false).is_ok());
+    }
+
+    #[test]
+    fn blind_forwarders_need_an_ip_filter_even_when_given_a_key() {
+        let addr = "0.0.0.0:8765".parse().unwrap();
+        assert!(validate_listener_policy(addr, true, true, false, false, false).is_err());
+        assert!(validate_listener_policy(addr, true, false, true, false, false).is_err());
+        assert!(validate_listener_policy(addr, true, true, false, true, false).is_ok());
+    }
 
     #[test]
     fn jitter_buffer_reorders_packets() {
