@@ -16,6 +16,10 @@ This is a source-level review with automated checks. It is not a penetration tes
 | Audio capture chunks were treated as if each callback always contained exactly one codec frame. | Non-aligned callback sizes could be discarded, causing dropouts. | PR #13 carries samples across callback boundaries and tests split-frame and multi-frame input. |
 | The desktop UI could inherit a transport key from its parent process even when the key field was blank. | An unexpected shell environment value could be passed to the worker. | PR #12 removes the inherited key before setting an explicitly supplied value. The key field is masked. |
 
+## Dependency audit triage
+
+The first RustSec run reported `ringbuf 0.4.8` (`RUSTSEC-2026-0293`) through `flexaudio-core`, plus four informational notices for unmaintained transitive crates. The ring-buffer advisory concerns `Consumer::clear` / `Consumer::skip` when an element destructor panics. The only ring-buffer element types in the capture dependency are `AudioChunk` and `SecondaryChunk`; they contain `Vec<f32>` and scalar fields and define no custom destructor, so the panic-triggered double-drop path is not reachable with those fixed types. `.cargo/audit.toml` contains a single advisory exception with that rationale and an explicit removal condition. CI prints `cargo tree -i ringbuf@0.4.8` so a future dependency change is visible. The four unmaintained notices remain visible and are not suppressed. Re-run the audit whenever the audio capture dependency changes.
+
 ## Residual risks
 
 - UDP does not provide congestion control, delivery guarantees, or protection from traffic floods. Keep the receiver behind a private LAN or VPN. A valid source address or a valid key does not prevent denial-of-service traffic.
