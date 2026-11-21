@@ -24,7 +24,7 @@ use std::{
 )]
 struct Args {
     /// Address to listen on.
-    #[arg(long, env = "SONIC_BRIDGE_LISTEN", default_value = "0.0.0.0:8765")]
+    #[arg(long, default_value = "0.0.0.0:8765")]
     listen: String,
 
     /// Forward received packets to another SonicBridge node.
