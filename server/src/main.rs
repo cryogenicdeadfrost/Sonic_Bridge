@@ -9,7 +9,11 @@ use sonic_bridge_shared::{
 use std::{
     collections::BTreeMap,
     net::UdpSocket,
-    sync::mpsc,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+        mpsc,
+    },
     time::{Duration, Instant},
 };
 
@@ -20,7 +24,7 @@ use std::{
 )]
 struct Args {
     /// Address to listen on.
-    #[arg(long, default_value = "0.0.0.0:8765")]
+    #[arg(long, env = "SONIC_BRIDGE_LISTEN", default_value = "0.0.0.0:8765")]
     listen: String,
 
     /// Forward received packets to another SonicBridge node.
@@ -109,6 +113,11 @@ impl JitterBuffer {
 
 fn main() -> Result<()> {
     let args = Args::parse();
+
+    let running = Arc::new(AtomicBool::new(true));
+    let stop_flag = Arc::clone(&running);
+    ctrlc::set_handler(move || stop_flag.store(false, Ordering::Relaxed))
+        .context("could not install Ctrl+C handler")?;
 
     let key = args
         .key_hex
@@ -205,7 +214,7 @@ fn main() -> Result<()> {
     let mut auth_failed = 0u64;
     let mut last_report = Instant::now();
 
-    loop {
+    while running.load(Ordering::Relaxed) {
         let len = match socket.recv(&mut buf) {
             Ok(len) => len,
             Err(error)
@@ -328,11 +337,11 @@ fn main() -> Result<()> {
         }
     }
 
-    #[allow(unreachable_code)]
-    {
-        drop(_stream);
-        Ok(())
-    }
+    eprintln!(
+        "Stopped. rx={received} forwarded={forwarded} concealed={concealed} dropped={dropped} auth_failed={auth_failed}"
+    );
+    drop(_stream);
+    Ok(())
 }
 
 #[cfg(test)]
