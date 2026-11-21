@@ -264,7 +264,6 @@ fn ship_frame(
     }
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
