@@ -377,14 +377,11 @@ fn main() -> Result<()> {
 
         while let Some((_sequence, packet)) = jitter.pop_next() {
             if packet.is_empty() {
-                match (decoder.as_mut(), tx.as_ref()) {
-                    (Some(decoder), Some(tx))
-                        if decoder.decode(&[], FRAME_SAMPLES, &mut decoded).is_ok()
-                            && tx.try_send(decoded.clone()).is_ok() =>
-                    {
+                if let (Some(decoder), Some(tx)) = (decoder.as_mut(), tx.as_ref()) {
+                    let decoded_ok = decoder.decode(&[], FRAME_SAMPLES, &mut decoded).is_ok();
+                    if decoded_ok && tx.try_send(decoded.clone()).is_ok() {
                         concealed += 1;
                     }
-                    _ => {}
                 }
                 continue;
             }
