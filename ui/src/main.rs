@@ -116,7 +116,7 @@ impl SonicBridgeApp {
                 ]);
 
                 if !self.key_hex.trim().is_empty() {
-                    command.args(["--key-hex", self.key_hex.trim()]);
+                    command.env("SONIC_BRIDGE_KEY", self.key_hex.trim());
                 }
             }
             Role::Receiver | Role::Relay => {
@@ -136,7 +136,7 @@ impl SonicBridgeApp {
                 }
 
                 if !self.key_hex.trim().is_empty() {
-                    command.args(["--key-hex", self.key_hex.trim()]);
+                    command.env("SONIC_BRIDGE_KEY", self.key_hex.trim());
                 }
             }
         }
