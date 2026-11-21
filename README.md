@@ -385,6 +385,8 @@ Do not expose UDP 8765 directly to the public Internet.
 
 ## Memory philosophy
 
+The release profile favours runtime throughput over the smallest possible executable. Thin LTO keeps the optimizer useful without making every release build needlessly expensive.
+
 The system is intentionally hostile to runaway buffering.
 
 There is no:

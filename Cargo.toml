@@ -20,8 +20,8 @@ rand = "0.10.4"
 ctrlc = "3"
 
 [profile.release]
-lto = true
+lto = "thin"
 codegen-units = 1
 strip = true
-opt-level = "z"
+opt-level = 3
 panic = "abort"
