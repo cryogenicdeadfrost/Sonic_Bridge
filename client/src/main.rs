@@ -219,7 +219,13 @@ mod tests {
                 .unwrap();
         }
 
-        assert_eq!(frames, vec![(0.0, (FRAME_LEN - 1) as f32), (FRAME_LEN as f32, (FRAME_LEN * 2 - 1) as f32)]);
+        assert_eq!(
+            frames,
+            vec![
+                (0.0, (FRAME_LEN - 1) as f32),
+                (FRAME_LEN as f32, (FRAME_LEN * 2 - 1) as f32)
+            ]
+        );
         assert_eq!(assembler.filled, 0);
     }
 
