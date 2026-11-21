@@ -2,7 +2,10 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use flexaudio::{OutputFormat, SourceKind, StreamConfig, open};
 use rusty_opus::{Application, OpusEncoder};
-use sonic_bridge_shared::{encrypt_payload, parse_key_hex, CHANNELS, FLAG_ENCRYPTED, FRAME_MS, FRAME_SAMPLES, PacketHeader, SAMPLE_RATE, NONCE_LEN};
+use sonic_bridge_shared::{
+    CHANNELS, FLAG_ENCRYPTED, FRAME_MS, FRAME_SAMPLES, NONCE_LEN, PacketHeader, SAMPLE_RATE,
+    encrypt_payload, parse_key_hex,
+};
 use std::{net::UdpSocket, thread, time::Duration};
 
 #[derive(Parser, Debug)]
