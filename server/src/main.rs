@@ -3,7 +3,9 @@ use clap::Parser;
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{FromSample, SizedSample};
 use rusty_opus::OpusDecoder;
-use sonic_bridge_shared::{CHANNELS, FRAME_MS, FRAME_SAMPLES, PacketHeader, SAMPLE_RATE};
+use sonic_bridge_shared::{
+    CHANNELS, FRAME_MS, FRAME_SAMPLES, PacketHeader, SAMPLE_RATE, decrypt_payload, parse_key_hex,
+};
 use std::{
     collections::BTreeMap,
     net::UdpSocket,
@@ -32,35 +34,58 @@ struct Args {
     /// Packet buffering before playback, in milliseconds.
     #[arg(long, default_value_t = 60)]
     jitter_ms: u32,
+
+    /// Optional 256-bit key as 64 hexadecimal characters.
+    #[arg(long, env = "SONIC_BRIDGE_KEY")]
+    key_hex: Option<String>,
+
+    /// Print receiver statistics at this interval.
+    #[arg(long, default_value_t = 5)]
+    stats_interval: u64,
 }
 
 struct JitterBuffer {
     packets: BTreeMap<u32, Vec<u8>>,
     next_sequence: Option<u32>,
     target_frames: usize,
+    max_frames: usize,
 }
 
 impl JitterBuffer {
     fn new(jitter_ms: u32) -> Self {
+        let target_frames =
+            ((jitter_ms as usize + FRAME_MS as usize - 1) / FRAME_MS as usize).clamp(1, 64);
+
         Self {
             packets: BTreeMap::new(),
             next_sequence: None,
-            target_frames: (jitter_ms / FRAME_MS as u32).max(1) as usize,
+            target_frames,
+            max_frames: target_frames + 8,
         }
     }
 
-    fn insert(&mut self, sequence: u32, payload: &[u8]) {
-        if self.next_sequence.is_none() {
-            self.next_sequence = Some(sequence);
+    fn insert(&mut self, sequence: u32, payload: &[u8]) -> bool {
+        let next = *self.next_sequence.get_or_insert(sequence);
+        let distance = sequence.wrapping_sub(next);
+
+        if distance >= 0x8000_0000 {
+            return false;
         }
 
-        if let Some(next) = self.next_sequence {
-            if sequence.wrapping_sub(next) < 0x8000_0000 {
-                self.packets
-                    .entry(sequence)
-                    .or_insert_with(|| payload.to_vec());
-            }
+        if distance as usize >= self.max_frames {
+            self.packets.clear();
+            self.next_sequence =
+                Some(sequence.wrapping_sub(self.target_frames.saturating_sub(1) as u32));
         }
+
+        if self.packets.len() >= self.max_frames && !self.packets.contains_key(&sequence) {
+            return false;
+        }
+
+        self.packets
+            .entry(sequence)
+            .or_insert_with(|| payload.to_vec());
+        true
     }
 
     fn ready(&self) -> bool {
@@ -84,6 +109,13 @@ impl JitterBuffer {
 
 fn main() -> Result<()> {
     let args = Args::parse();
+
+    let key = args
+        .key_hex
+        .as_deref()
+        .map(parse_key_hex)
+        .transpose()
+        .context("invalid SonicBridge encryption key")?;
 
     let socket =
         UdpSocket::bind(&args.listen).context("could not bind the SonicBridge UDP socket")?;
@@ -138,7 +170,7 @@ fn main() -> Result<()> {
         (None, None)
     };
 
-    eprintln!("SonicBridge server v0.2");
+    eprintln!("SonicBridge server v0.3");
     eprintln!("Listening on {}", args.listen);
     eprintln!(
         "Relay target: {}",
@@ -170,6 +202,7 @@ fn main() -> Result<()> {
     let mut forwarded = 0u64;
     let mut concealed = 0u64;
     let mut dropped = 0u64;
+    let mut auth_failed = 0u64;
     let mut last_report = Instant::now();
 
     loop {
@@ -216,10 +249,46 @@ fn main() -> Result<()> {
         }
 
         if args.relay_only {
+            if last_report.elapsed() >= Duration::from_secs(args.stats_interval.max(1)) {
+                eprintln!(
+                    "stats: rx={} forwarded={} concealed={} dropped={} auth_failed={} jitter={}",
+                    received,
+                    forwarded,
+                    concealed,
+                    dropped,
+                    auth_failed,
+                    jitter.packets.len()
+                );
+                last_report = Instant::now();
+            }
             continue;
         }
 
-        jitter.insert(header.sequence, payload);
+        let decrypted_payload = if header.encrypted() {
+            if let Some(key) = key.as_ref() {
+                match decrypt_payload(key, &header, payload) {
+                    Ok(value) => value,
+                    Err(_) => {
+                        auth_failed += 1;
+                        continue;
+                    }
+                }
+            } else {
+                dropped += 1;
+                continue;
+            }
+        } else {
+            if key.is_some() {
+                auth_failed += 1;
+                continue;
+            }
+            payload.to_vec()
+        };
+
+        if !jitter.insert(header.sequence, &decrypted_payload) {
+            dropped += 1;
+            continue;
+        }
 
         while let Some((_sequence, packet)) = jitter.pop_next() {
             if packet.is_empty() {
@@ -245,10 +314,15 @@ fn main() -> Result<()> {
             }
         }
 
-        if last_report.elapsed() >= Duration::from_secs(5) {
+        if last_report.elapsed() >= Duration::from_secs(args.stats_interval.max(1)) {
             eprintln!(
-                "stats: rx={} forwarded={} concealed={} dropped={}",
-                received, forwarded, concealed, dropped
+                "stats: rx={} forwarded={} concealed={} dropped={} auth_failed={} jitter={}",
+                received,
+                forwarded,
+                concealed,
+                dropped,
+                auth_failed,
+                jitter.packets.len()
             );
             last_report = Instant::now();
         }
@@ -258,6 +332,56 @@ fn main() -> Result<()> {
     {
         drop(_stream);
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn jitter_buffer_reorders_packets() {
+        let mut buffer = JitterBuffer::new(20);
+
+        assert!(buffer.insert(10, &[10]));
+        assert!(buffer.insert(12, &[12]));
+        assert!(buffer.insert(11, &[11]));
+
+        assert_eq!(buffer.pop_next().unwrap(), (10, vec![10]));
+        assert_eq!(buffer.pop_next().unwrap(), (11, vec![11]));
+        assert_eq!(buffer.pop_next().unwrap(), (12, vec![12]));
+    }
+
+    #[test]
+    fn jitter_buffer_handles_sequence_wraparound() {
+        let mut buffer = JitterBuffer::new(20);
+
+        assert!(buffer.insert(u32::MAX - 1, &[1]));
+        assert!(buffer.insert(0, &[3]));
+        assert!(buffer.insert(u32::MAX, &[2]));
+
+        assert_eq!(buffer.pop_next().unwrap(), (u32::MAX - 1, vec![1]));
+        assert_eq!(buffer.pop_next().unwrap(), (u32::MAX, vec![2]));
+        assert_eq!(buffer.pop_next().unwrap(), (0, vec![3]));
+    }
+
+    #[test]
+    fn jitter_buffer_rejects_old_packets() {
+        let mut buffer = JitterBuffer::new(20);
+        assert!(buffer.insert(100, &[1]));
+        assert!(!buffer.insert(99, &[2]));
+    }
+
+    #[test]
+    fn jitter_buffer_memory_is_bounded() {
+        let mut buffer = JitterBuffer::new(u32::MAX);
+
+        for sequence in 0..100_000u32 {
+            let _ = buffer.insert(sequence, &[0u8; 128]);
+            assert!(buffer.packets.len() <= buffer.max_frames);
+        }
+
+        assert!(buffer.max_frames <= 72);
     }
 }
 
