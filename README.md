@@ -4,7 +4,7 @@
 
 SonicBridge is a small Rust audio relay for the slightly ridiculous problem of wanting a Windows PC to play through Bluetooth headphones or speakers attached to a Raspberry Pi.
 
-Version 0.2 keeps the original idea, but turns it into an actual platform:
+Version 0.3 keeps the original idea, but turns it into an actual platform:
 
 - CLI-first daemons for unattended machines
 - a native Rust GUI for humans who would rather click a button
@@ -14,6 +14,8 @@ Version 0.2 keeps the original idea, but turns it into an actual platform:
 - multi-Pi forwarding
 - TTL protection against relay loops
 - one receiver binary that can be a player, relay, or both
+- optional authenticated audio transport with XChaCha20-Poly1305
+- receiver authentication-failure and jitter statistics
 
 The core remains deliberately boring. That is a compliment.
 
@@ -104,6 +106,7 @@ The GUI exposes the settings that actually matter:
 - next relay
 - jitter-buffer size
 - relay-only mode
+- optional 256-bit transport key
 
 The GUI does not replace the daemon. It controls it.
 
@@ -147,17 +150,64 @@ Each relay decrements the packet TTL. If the TTL reaches zero, the packet is not
 
 This is deliberately primitive. Primitive is good when the alternative is debugging a five-node audio feedback loop at 2 AM.
 
+## Secure transport
+
+Version 0.3 adds optional authenticated encryption for the audio payload.
+
+The primitive is XChaCha20-Poly1305 from RustCrypto. It is a pure-Rust AEAD implementation with a 192-bit nonce, which gives us a large nonce space without making the Pi run a heavyweight crypto stack. citeturn405635search0turn486953search2
+
+Enable it on the client:
+
+    sonic-bridge-client \
+      --target 100.64.0.10:8765 \
+      --key-hex 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
+
+and configure the same 64-hex-character key on the receiver:
+
+    sonic-bridge-server \
+      --listen 0.0.0.0:8765 \
+      --key-hex 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
+
+The GUI exposes the same key as a masked field.
+
+A relay does not need the key. It forwards the authenticated ciphertext and only changes the packet TTL. This means the chain can remain:
+
+    PC -> encrypted Pi #1 -> encrypted Pi #2 -> encrypted Pi #3 -> Bluetooth
+
+Without a configured key, v0.3 retains plaintext operation for local development and compatibility testing.
+
+The key is deliberately passed as an argument or environment variable in this release. Do not put a real production key in a committed README, shell history, or public configuration file.
+
+## Runtime statistics
+
+The receiver now reports:
+
+    rx
+    forwarded
+    concealed
+    dropped
+    auth_failed
+    jitter
+
+Example:
+
+    stats: rx=1200 forwarded=1180 concealed=4 dropped=2 auth_failed=0 jitter=3
+
+This gives the CLI a useful low-overhead health signal without introducing a database, telemetry service, or giant monitoring stack.
+
 ## Packet format
 
-Version 0.2 keeps the same 18-byte header shape but gives the previous reserved byte a real job.
+Version 0.3 uses a 43-byte header and carries an explicit encryption flag plus a 24-byte XChaCha20 nonce.
 
     magic(4)
     version(1)
     channels(1)
     frame_ms(1)
     ttl(1)
+    flags(1)
     sequence(4)
     sample_rate(4)
+    nonce(24)
     payload_len(2)
     payload(...)
 
@@ -179,7 +229,7 @@ The first version delivered packets almost immediately.
 
 That is nice until Wi-Fi decides that packet 381 should take the scenic route.
 
-Version 0.2 adds a small configurable packet-depth jitter buffer. The default is 60 ms.
+Version 0.3 adds a small configurable packet-depth jitter buffer. The default is 60 ms.
 
 The receiver can trade latency for resilience:
 
@@ -329,9 +379,13 @@ If the network is behind, the system should lose audio rather than slowly transf
 
 ### 0.3
 
+- [x] Optional XChaCha20-Poly1305 authenticated audio payloads
+- [x] Masked encryption-key field in the GUI
+- [x] Authentication-failure counters
+- [x] Runtime receiver statistics
+- [x] Relay forwarding of encrypted packets without decrypting them
 - [ ] BlueZ device discovery in the GUI
 - [ ] Automatic PipeWire Bluetooth sink selection
-- [ ] Authenticated packet encryption
 - [ ] Latency and packet-loss dashboard
 - [ ] Automatic reconnect state machine
 - [ ] Persistent TOML configuration
