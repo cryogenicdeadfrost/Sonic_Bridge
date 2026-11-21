@@ -4,3 +4,8 @@ Cargo.lock
 .idea/
 *.log
 .DS_Store
+.env
+.env.*
+!.env.example
+*.key
+*.pem
