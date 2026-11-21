@@ -164,23 +164,27 @@ A simple chain looks like:
      ▼
     Bluetooth sink
 
-Pi #1:
+Pi #1 (only accept the PC's Tailscale/LAN address):
 
     sonic-bridge-server \
       --listen 0.0.0.0:8765 \
+      --allowed-peer <PC-IP> \
       --forward-to 100.64.0.11:8765 \
       --relay-only
 
-Pi #2:
+Pi #2 (only accept Pi #1):
 
     sonic-bridge-server \
       --listen 0.0.0.0:8765 \
+      --allowed-peer 100.64.0.10 \
       --forward-to 100.64.0.12:8765 \
       --relay-only
 
-Pi #3:
+Pi #3 (the playback node, with the shared key):
 
-    sonic-bridge-server --listen 0.0.0.0:8765
+    sonic-bridge-server \
+      --listen 0.0.0.0:8765 \
+      --key-hex <64-hex-key>
 
 The client sends to Pi #1.
 
@@ -212,7 +216,7 @@ A relay does not need the key. It forwards the authenticated ciphertext and only
 
     PC -> encrypted Pi #1 -> encrypted Pi #2 -> encrypted Pi #3 -> Bluetooth
 
-Without a configured key, v0.3 retains plaintext operation for local development and compatibility testing.
+Without a configured key, v0.3 retains plaintext operation for local development and compatibility testing. The receiver defaults to loopback. A non-loopback listener now requires encryption, a source-IP allow-list, or the explicit `--allow-insecure-listen` opt-in.
 
 The key can be supplied through `--key-hex` or `SONIC_BRIDGE_KEY`. Prefer the environment variable for interactive use so the secret is not visible in the process command line. Do not put a real key in a committed README, shell history, or public configuration file.
 
@@ -345,10 +349,14 @@ Build the GUI:
 
 ## Persistent Pi installation
 
-The existing installer can install the receiver as a systemd service.
+The existing installer can install the receiver as a systemd service running under a dedicated unprivileged account. Configure the key and network policy through environment variables. The key is written to a root-only environment file, not into the unit command line.
 
     chmod +x scripts/install-pi.sh
+    SONIC_BRIDGE_KEY="<64 hex characters>" \\
+    SONIC_BRIDGE_LISTEN="0.0.0.0:8765" \\
     ./scripts/install-pi.sh ./target/release/sonic-bridge-server
+
+For a keyless relay, set `SONIC_BRIDGE_RELAY_ONLY=true` and provide `SONIC_BRIDGE_ALLOWED_PEERS` as a comma-separated list of trusted sender IPs. To run plaintext on a trusted private network without an allow-list, set `SONIC_BRIDGE_ALLOW_INSECURE_LISTEN=true` explicitly.
 
 For a relay, configure the service with the forwarding options shown above.
 
@@ -359,7 +367,7 @@ The service is designed to restart after failure and start after networking and 
     Set-ExecutionPolicy -Scope Process Bypass
     .\scripts\install-windows.ps1 -Target 100.64.0.10:8765
 
-The current installer uses a Windows Scheduled Task at logon.
+The current installer uses a Windows Scheduled Task at logon. The target is validated and passed as one quoted argument.
 
 The next step is a proper tray/service split so the GUI can remain separate from the persistent audio worker.
 
