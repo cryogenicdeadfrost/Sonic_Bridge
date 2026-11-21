@@ -100,8 +100,9 @@ struct JitterBuffer {
 
 impl JitterBuffer {
     fn new(jitter_ms: u32) -> Self {
-        let target_frames =
-            (jitter_ms as usize).div_ceil(FRAME_MS as usize).clamp(1, 64);
+        let target_frames = (jitter_ms as usize)
+            .div_ceil(FRAME_MS as usize)
+            .clamp(1, 64);
 
         Self {
             packets: BTreeMap::new(),
