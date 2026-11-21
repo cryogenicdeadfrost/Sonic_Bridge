@@ -1,6 +1,6 @@
 use chacha20poly1305::{
     XChaCha20Poly1305, XNonce,
-    aead::{Aead, KeyInit},
+    aead::{Aead, KeyInit, Payload},
 };
 use std::io;
 
@@ -14,6 +14,7 @@ pub const FRAME_SAMPLES: usize = 960;
 
 pub const FLAG_ENCRYPTED: u8 = 0x01;
 pub const NONCE_LEN: usize = 24;
+pub const AAD_LEN: usize = 40;
 
 // Header:
 // magic(4) + version(1) + channels(1) + frame_ms(1) + ttl(1)
@@ -57,12 +58,19 @@ impl PacketHeader {
             ));
         }
 
+        if buf[8] & !FLAG_ENCRYPTED != 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "unsupported SonicBridge packet flags",
+            ));
+        }
+
         let payload_len = u16::from_be_bytes([buf[41], buf[42]]) as usize;
 
-        if buf.len() < HEADER_LEN + payload_len {
+        if buf.len() != HEADER_LEN + payload_len {
             return Err(io::Error::new(
-                io::ErrorKind::UnexpectedEof,
-                "truncated SonicBridge packet",
+                io::ErrorKind::InvalidData,
+                "SonicBridge packet length does not match its header",
             ));
         }
 
@@ -79,7 +87,24 @@ impl PacketHeader {
             nonce,
         };
 
-        Ok((header, &buf[HEADER_LEN..HEADER_LEN + payload_len]))
+        Ok((header, &buf[HEADER_LEN..]))
+    }
+
+    // TTL is intentionally excluded because intermediate relays decrement it.
+    // The stream identity and audio-format fields must remain authenticated.
+    pub fn authenticated_data(&self) -> [u8; AAD_LEN] {
+        let mut aad = [0u8; AAD_LEN];
+
+        aad[0..4].copy_from_slice(&MAGIC);
+        aad[4] = VERSION;
+        aad[5] = self.channels;
+        aad[6] = self.frame_ms;
+        aad[7] = self.flags;
+        aad[8..12].copy_from_slice(&self.sequence.to_be_bytes());
+        aad[12..16].copy_from_slice(&self.sample_rate.to_be_bytes());
+        aad[16..40].copy_from_slice(&self.nonce);
+
+        aad
     }
 
     pub fn decremented_ttl(mut self) -> Option<Self> {
@@ -121,27 +146,47 @@ pub fn parse_key_hex(value: &str) -> io::Result<[u8; 32]> {
     Ok(key)
 }
 
-pub fn encrypt_payload(key: &[u8; 32], plaintext: &[u8]) -> io::Result<([u8; NONCE_LEN], Vec<u8>)> {
+pub fn fresh_nonce() -> [u8; NONCE_LEN] {
+    rand::random::<[u8; NONCE_LEN]>()
+}
+
+pub fn encrypt_payload(
+    key: &[u8; 32],
+    header: &PacketHeader,
+    plaintext: &[u8],
+) -> io::Result<Vec<u8>> {
     let cipher = XChaCha20Poly1305::new(key.into());
-    let nonce = XNonce::from(rand::random::<[u8; NONCE_LEN]>());
+    let nonce = XNonce::from(header.nonce);
+    let aad = header.authenticated_data();
 
-    let ciphertext = cipher
-        .encrypt(&nonce, plaintext)
-        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "audio encryption failed"))?;
-
-    Ok((nonce.into(), ciphertext))
+    cipher
+        .encrypt(
+            &nonce,
+            Payload {
+                msg: plaintext,
+                aad: &aad,
+            },
+        )
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "audio encryption failed"))
 }
 
 pub fn decrypt_payload(
     key: &[u8; 32],
-    nonce: &[u8; NONCE_LEN],
+    header: &PacketHeader,
     ciphertext: &[u8],
 ) -> io::Result<Vec<u8>> {
     let cipher = XChaCha20Poly1305::new(key.into());
-    let nonce = XNonce::from(*nonce);
+    let nonce = XNonce::from(header.nonce);
+    let aad = header.authenticated_data();
 
     cipher
-        .decrypt(&nonce, ciphertext)
+        .decrypt(
+            &nonce,
+            Payload {
+                msg: ciphertext,
+                aad: &aad,
+            },
+        )
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "audio authentication failed"))
 }
 
@@ -149,18 +194,21 @@ pub fn decrypt_payload(
 mod tests {
     use super::*;
 
-    #[test]
-    fn packet_round_trip() {
-        let header = PacketHeader {
+    fn test_header() -> PacketHeader {
+        PacketHeader {
             sequence: 42,
             sample_rate: SAMPLE_RATE,
             channels: CHANNELS,
             frame_ms: FRAME_MS,
             ttl: 8,
-            flags: 0,
-            nonce: [0; NONCE_LEN],
-        };
+            flags: FLAG_ENCRYPTED,
+            nonce: fresh_nonce(),
+        }
+    }
 
+    #[test]
+    fn packet_round_trip() {
+        let header = test_header();
         let payload = [1, 2, 3, 4];
         let mut packet = Vec::new();
 
@@ -175,10 +223,11 @@ mod tests {
     #[test]
     fn encrypted_payload_round_trip() {
         let key = [7u8; 32];
+        let header = test_header();
         let plaintext = b"audio frame";
 
-        let (nonce, ciphertext) = encrypt_payload(&key, plaintext).unwrap();
-        let decrypted = decrypt_payload(&key, &nonce, &ciphertext).unwrap();
+        let ciphertext = encrypt_payload(&key, &header, plaintext).unwrap();
+        let decrypted = decrypt_payload(&key, &header, &ciphertext).unwrap();
 
         assert_eq!(decrypted, plaintext);
     }
@@ -187,9 +236,34 @@ mod tests {
     fn wrong_key_is_rejected() {
         let key = [7u8; 32];
         let wrong_key = [8u8; 32];
-        let (nonce, ciphertext) = encrypt_payload(&key, b"audio").unwrap();
+        let header = test_header();
+        let ciphertext = encrypt_payload(&key, &header, b"audio").unwrap();
 
-        assert!(decrypt_payload(&wrong_key, &nonce, &ciphertext).is_err());
+        assert!(decrypt_payload(&wrong_key, &header, &ciphertext).is_err());
+    }
+
+    #[test]
+    fn stream_metadata_is_authenticated() {
+        let key = [7u8; 32];
+        let header = test_header();
+        let ciphertext = encrypt_payload(&key, &header, b"audio").unwrap();
+        let mut changed = header;
+        changed.sequence = changed.sequence.wrapping_add(1);
+
+        assert!(decrypt_payload(&key, &changed, &ciphertext).is_err());
+    }
+
+    #[test]
+    fn relay_can_decrement_ttl_without_breaking_authentication() {
+        let key = [7u8; 32];
+        let header = test_header();
+        let ciphertext = encrypt_payload(&key, &header, b"audio").unwrap();
+        let forwarded_header = header.decremented_ttl().unwrap();
+
+        assert_eq!(
+            decrypt_payload(&key, &forwarded_header, &ciphertext).unwrap(),
+            b"audio"
+        );
     }
 
     #[test]
@@ -199,19 +273,36 @@ mod tests {
     }
 
     #[test]
-    fn ttl_reaches_zero_then_dies() {
-        let header = PacketHeader {
-            sequence: 1,
-            sample_rate: SAMPLE_RATE,
-            channels: CHANNELS,
-            frame_ms: FRAME_MS,
-            ttl: 1,
-            flags: 0,
-            nonce: [0; NONCE_LEN],
-        };
+    fn trailing_packet_bytes_are_rejected() {
+        let header = test_header();
+        let mut packet = Vec::new();
+        header.encode(&[1, 2, 3], &mut packet);
+        packet.push(4);
 
+        assert_eq!(
+            PacketHeader::decode(&packet).unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
+    }
+
+    #[test]
+    fn unsupported_flags_are_rejected() {
+        let header = test_header();
+        let mut packet = Vec::new();
+        header.encode(&[1, 2, 3], &mut packet);
+        packet[8] = 0x80;
+
+        assert_eq!(
+            PacketHeader::decode(&packet).unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
+    }
+
+    #[test]
+    fn ttl_reaches_zero_then_dies() {
+        let header = test_header();
         let next = header.decremented_ttl().unwrap();
-        assert_eq!(next.ttl, 0);
-        assert!(next.decremented_ttl().is_none());
+        assert_eq!(next.ttl, 7);
+        assert!(PacketHeader { ttl: 0, ..next }.decremented_ttl().is_none());
     }
 }
