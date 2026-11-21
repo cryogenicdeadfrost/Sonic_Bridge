@@ -87,6 +87,9 @@ fn main() -> Result<()> {
     socket
         .connect(&args.target)
         .with_context(|| format!("could not connect to {}", args.target))?;
+    socket
+        .set_nonblocking(true)
+        .context("could not make the UDP sender non-blocking")?;
 
     let mut encoder = OpusEncoder::new(SAMPLE_RATE as i32, CHANNELS as usize, Application::Audio)
         .context("could not initialise Opus")?;
@@ -117,8 +120,8 @@ fn main() -> Result<()> {
     let mut sequence = 0u32;
     let mut sent = 0u64;
     let mut assembler = FrameAssembler::default();
-    let mut encoded = [0u8; MAX_OPUS_FRAME_BYTES];
-    let mut packet = Vec::with_capacity(1_350);
+    let mut scratch = PacketScratch::default();
+    let mut send_dropped = 0u64;
     let mut last_report = Instant::now();
 
     while running.load(Ordering::Relaxed) {
@@ -129,30 +132,32 @@ fn main() -> Result<()> {
 
         // Capture callback boundaries rarely line up with codec frame boundaries.
         assembler.push(&chunk.data, |frame| {
-            ship_frame(
+            if ship_frame(
                 &mut encoder,
                 frame,
                 key.as_ref(),
                 args.ttl,
                 sequence,
-                &mut encoded,
-                &mut packet,
+                &mut scratch,
                 &socket,
-            )?;
+            )? {
+                sent += 1;
+            } else {
+                send_dropped += 1;
+            }
             sequence = sequence.wrapping_add(1);
-            sent += 1;
             Ok(())
         })?;
 
         if args.stats_interval > 0
             && last_report.elapsed() >= Duration::from_secs(args.stats_interval)
         {
-            eprintln!("stats: sent={sent} packets");
+            eprintln!("stats: sent={sent} dropped={send_dropped} packets");
             last_report = Instant::now();
         }
     }
 
-    eprintln!("Stopped. Sent {sent} audio packets.");
+    eprintln!("Stopped. sent={sent} dropped={send_dropped} audio packets.");
     Ok(())
 }
 
@@ -192,6 +197,70 @@ impl FrameAssembler {
         }
 
         Ok(())
+    }
+}
+
+struct PacketScratch {
+    encoded: [u8; MAX_OPUS_FRAME_BYTES],
+    packet: Vec<u8>,
+}
+
+impl Default for PacketScratch {
+    fn default() -> Self {
+        Self {
+            encoded: [0; MAX_OPUS_FRAME_BYTES],
+            packet: Vec::with_capacity(1_350),
+        }
+    }
+}
+
+fn ship_frame(
+    encoder: &mut OpusEncoder,
+    frame: &[f32; FRAME_LEN],
+    key: Option<&[u8; 32]>,
+    ttl: u8,
+    sequence: u32,
+    scratch: &mut PacketScratch,
+    socket: &UdpSocket,
+) -> Result<bool> {
+    let encoded_len = encoder
+        .encode(frame, FRAME_SAMPLES, &mut scratch.encoded)
+        .context("Opus encoding failed")?;
+
+    if let Some(key) = key {
+        let header = PacketHeader {
+            sequence,
+            sample_rate: SAMPLE_RATE,
+            channels: CHANNELS,
+            frame_ms: FRAME_MS,
+            ttl,
+            flags: FLAG_ENCRYPTED,
+            nonce: fresh_nonce(),
+        };
+        let ciphertext = encrypt_payload(key, &header, &scratch.encoded[..encoded_len])
+            .context("could not encrypt audio frame")?;
+        header.encode(&ciphertext, &mut scratch.packet)?;
+    } else {
+        let header = PacketHeader {
+            sequence,
+            sample_rate: SAMPLE_RATE,
+            channels: CHANNELS,
+            frame_ms: FRAME_MS,
+            ttl,
+            flags: 0,
+            nonce: [0u8; NONCE_LEN],
+        };
+        header.encode(&scratch.encoded[..encoded_len], &mut scratch.packet)?;
+    }
+
+    match socket.send(&scratch.packet) {
+        Ok(size) if size == scratch.packet.len() => Ok(true),
+        Ok(size) => bail!(
+            "UDP datagram send returned {size} bytes (expected {})",
+            scratch.packet.len()
+        ),
+        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => Ok(false),
+        Err(error) => Err(error).context("could not send audio packet"),
     }
 }
 
@@ -252,48 +321,4 @@ mod tests {
             .unwrap();
         assert_eq!(frames_sent, 1);
     }
-}
-
-fn ship_frame(
-    encoder: &mut OpusEncoder,
-    frame: &[f32; FRAME_SAMPLES * CHANNELS as usize],
-    key: Option<&[u8; 32]>,
-    ttl: u8,
-    sequence: u32,
-    encoded: &mut [u8; MAX_OPUS_FRAME_BYTES],
-    packet: &mut Vec<u8>,
-    socket: &UdpSocket,
-) -> Result<()> {
-    let encoded_len = encoder
-        .encode(frame, FRAME_SAMPLES, encoded)
-        .context("Opus encoding failed")?;
-
-    if let Some(key) = key {
-        let header = PacketHeader {
-            sequence,
-            sample_rate: SAMPLE_RATE,
-            channels: CHANNELS,
-            frame_ms: FRAME_MS,
-            ttl,
-            flags: FLAG_ENCRYPTED,
-            nonce: fresh_nonce(),
-        };
-        let ciphertext = encrypt_payload(key, &header, &encoded[..encoded_len])
-            .context("could not encrypt audio frame")?;
-        header.encode(&ciphertext, packet);
-    } else {
-        let header = PacketHeader {
-            sequence,
-            sample_rate: SAMPLE_RATE,
-            channels: CHANNELS,
-            frame_ms: FRAME_MS,
-            ttl,
-            flags: 0,
-            nonce: [0u8; NONCE_LEN],
-        };
-        header.encode(&encoded[..encoded_len], packet);
-    }
-
-    socket.send(packet).context("could not send audio packet")?;
-    Ok(())
 }

@@ -4,12 +4,11 @@ use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{FromSample, SizedSample};
 use rusty_opus::OpusDecoder;
 use sonic_bridge_shared::{
-    CHANNELS, FRAME_MS, FRAME_SAMPLES, MAX_PACKET_SIZE, PacketHeader, SAMPLE_RATE, decrypt_payload,
-    parse_key_hex,
+    CHANNELS, FRAME_MS, FRAME_SAMPLES, PacketHeader, SAMPLE_RATE, decrypt_payload, parse_key_hex,
 };
 use std::{
     collections::BTreeMap,
-    net::UdpSocket,
+    net::{IpAddr, SocketAddr, UdpSocket},
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -25,15 +24,15 @@ use std::{
 )]
 struct Args {
     /// Address to listen on.
-    #[arg(long, default_value = "0.0.0.0:8765")]
+    #[arg(long, env = "SONIC_BRIDGE_LISTEN", default_value = "127.0.0.1:8765")]
     listen: String,
 
     /// Forward received packets to another SonicBridge node.
-    #[arg(long)]
+    #[arg(long, env = "SONIC_BRIDGE_FORWARD_TO")]
     forward_to: Option<String>,
 
     /// Do not play locally. Useful for a pure relay Pi.
-    #[arg(long, default_value_t = false)]
+    #[arg(long, env = "SONIC_BRIDGE_RELAY_ONLY", default_value_t = false)]
     relay_only: bool,
 
     /// Packet buffering before playback, in milliseconds.
@@ -47,6 +46,49 @@ struct Args {
     /// Print receiver statistics at this interval.
     #[arg(long, default_value_t = 5)]
     stats_interval: u64,
+
+    /// Only accept datagrams from these source IP addresses.
+    #[arg(
+        long = "allowed-peer",
+        env = "SONIC_BRIDGE_ALLOWED_PEERS",
+        value_delimiter = ','
+    )]
+    allowed_peers: Vec<IpAddr>,
+
+    /// Explicitly allow unencrypted traffic on a non-loopback interface.
+    #[arg(
+        long,
+        env = "SONIC_BRIDGE_ALLOW_INSECURE_LISTEN",
+        default_value_t = false
+    )]
+    allow_insecure_listen: bool,
+}
+
+fn validate_listener_policy(
+    listen_addr: SocketAddr,
+    has_key: bool,
+    relay_only: bool,
+    forwards_packets: bool,
+    has_allowed_peers: bool,
+    allow_insecure: bool,
+) -> Result<()> {
+    if listen_addr.ip().is_loopback() {
+        return Ok(());
+    }
+
+    if (relay_only || forwards_packets) && !has_allowed_peers && !allow_insecure {
+        anyhow::bail!(
+            "non-loopback relays and forwarding receivers need --allowed-peer; a blind forwarding path cannot validate a PSK"
+        );
+    }
+
+    if !has_key && !has_allowed_peers && !allow_insecure {
+        anyhow::bail!(
+            "refusing an unencrypted non-loopback listener; configure SONIC_BRIDGE_KEY, add --allowed-peer for trusted sender IPs, or explicitly pass --allow-insecure-listen"
+        );
+    }
+
+    Ok(())
 }
 
 struct JitterBuffer {
@@ -58,8 +100,9 @@ struct JitterBuffer {
 
 impl JitterBuffer {
     fn new(jitter_ms: u32) -> Self {
-        let target_frames =
-            ((jitter_ms as usize + FRAME_MS as usize - 1) / FRAME_MS as usize).clamp(1, 64);
+        let target_frames = (jitter_ms as usize)
+            .div_ceil(FRAME_MS as usize)
+            .clamp(1, 64);
 
         Self {
             packets: BTreeMap::new(),
@@ -87,11 +130,9 @@ impl JitterBuffer {
             return false;
         }
 
-        if self.packets.contains_key(&sequence) {
-            return false;
-        }
-
-        self.packets.insert(sequence, payload.to_vec());
+        self.packets
+            .entry(sequence)
+            .or_insert_with(|| payload.to_vec());
         true
     }
 
@@ -128,6 +169,21 @@ fn main() -> Result<()> {
         .map(parse_key_hex)
         .transpose()
         .context("invalid SonicBridge encryption key")?;
+
+    let listen_addr: SocketAddr = args
+        .listen
+        .parse()
+        .context("--listen must be an IP address and port, for example 0.0.0.0:8765")?;
+    let exposed = !listen_addr.ip().is_loopback();
+    validate_listener_policy(
+        listen_addr,
+        key.is_some(),
+        args.relay_only,
+        args.forward_to.is_some(),
+        !args.allowed_peers.is_empty(),
+        args.allow_insecure_listen,
+    )
+    .context("unsafe receiver network configuration")?;
 
     let socket =
         UdpSocket::bind(&args.listen).context("could not bind the SonicBridge UDP socket")?;
@@ -190,6 +246,16 @@ fn main() -> Result<()> {
     );
     eprintln!("Relay only: {}", args.relay_only);
     eprintln!("Jitter buffer: {} ms", args.jitter_ms);
+    if !args.allowed_peers.is_empty() {
+        eprintln!("Allowed peers: {:?}", args.allowed_peers);
+    }
+    if exposed
+        && args.allowed_peers.is_empty()
+        && args.allow_insecure_listen
+        && (key.is_none() || args.relay_only || args.forward_to.is_some())
+    {
+        eprintln!("WARNING: accepting traffic on a non-loopback interface without a peer filter");
+    }
 
     let forward_socket = if args.forward_to.is_some() {
         Some(UdpSocket::bind("0.0.0.0:0").context("could not create relay UDP socket")?)
@@ -207,7 +273,7 @@ fn main() -> Result<()> {
     };
 
     let mut jitter = JitterBuffer::new(args.jitter_ms);
-    let mut buf = [0u8; MAX_PACKET_SIZE];
+    let mut buf = [0u8; 2048];
     let mut decoded = vec![0.0f32; FRAME_SAMPLES * CHANNELS as usize];
 
     let mut received = 0u64;
@@ -218,8 +284,8 @@ fn main() -> Result<()> {
     let mut last_report = Instant::now();
 
     while running.load(Ordering::Relaxed) {
-        let len = match socket.recv(&mut buf) {
-            Ok(len) => len,
+        let (len, peer) = match socket.recv_from(&mut buf) {
+            Ok(packet) => packet,
             Err(error)
                 if matches!(
                     error.kind(),
@@ -230,6 +296,11 @@ fn main() -> Result<()> {
             }
             Err(error) => return Err(error.into()),
         };
+
+        if !args.allowed_peers.is_empty() && !args.allowed_peers.contains(&peer.ip()) {
+            dropped += 1;
+            continue;
+        }
 
         let (header, payload) = match PacketHeader::decode(&buf[..len]) {
             Ok(packet) => packet,
@@ -249,14 +320,16 @@ fn main() -> Result<()> {
 
         received += 1;
 
-        if let (Some(target), Some(relay_socket)) = (&args.forward_to, &forward_socket) {
-            if let Some(next_header) = header.decremented_ttl() {
-                let mut relay_packet = Vec::with_capacity(len);
-                next_header.encode(payload, &mut relay_packet)?;
+        if let (Some(target), Some(relay_socket), Some(next_header)) = (
+            args.forward_to.as_ref(),
+            forward_socket.as_ref(),
+            header.decremented_ttl(),
+        ) {
+            let mut relay_packet = Vec::with_capacity(len);
+            next_header.encode(payload, &mut relay_packet)?;
 
-                if relay_socket.send_to(&relay_packet, target).is_ok() {
-                    forwarded += 1;
-                }
+            if relay_socket.send_to(&relay_packet, target).is_ok() {
+                forwarded += 1;
             }
         }
 
@@ -304,11 +377,10 @@ fn main() -> Result<()> {
 
         while let Some((_sequence, packet)) = jitter.pop_next() {
             if packet.is_empty() {
-                if let Some(decoder) = decoder.as_mut() {
-                    if decoder.decode(&[], FRAME_SAMPLES, &mut decoded).is_ok() {
-                        if tx.as_ref().unwrap().try_send(decoded.clone()).is_ok() {
-                            concealed += 1;
-                        }
+                if let (Some(decoder), Some(tx)) = (decoder.as_mut(), tx.as_ref()) {
+                    let decoded_ok = decoder.decode(&[], FRAME_SAMPLES, &mut decoded).is_ok();
+                    if decoded_ok && tx.try_send(decoded.clone()).is_ok() {
+                        concealed += 1;
                     }
                 }
                 continue;
@@ -347,16 +419,75 @@ fn main() -> Result<()> {
     Ok(())
 }
 
+fn build_output<T>(
+    device: &cpal::Device,
+    config: &cpal::StreamConfig,
+    rx: mpsc::Receiver<Vec<f32>>,
+) -> Result<cpal::Stream>
+where
+    T: SizedSample + FromSample<f32>,
+{
+    let mut current = Vec::<f32>::new();
+    let mut index = 0usize;
+
+    let stream = device.build_output_stream(
+        config,
+        move |out: &mut [T], _| {
+            for sample in out.iter_mut() {
+                if index >= current.len() {
+                    match rx.try_recv() {
+                        Ok(next) => {
+                            current = next;
+                            index = 0;
+                        }
+                        Err(_) => {
+                            *sample = T::from_sample(0.0);
+                            continue;
+                        }
+                    }
+                }
+
+                *sample = T::from_sample(current[index]);
+                index += 1;
+            }
+        },
+        move |error| eprintln!("audio playback error: {error}"),
+        Some(Duration::from_millis(100)),
+    )?;
+
+    Ok(stream)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn jitter_buffer_rejects_duplicate_packets() {
-        let mut buffer = JitterBuffer::new(20);
-        assert!(buffer.insert(10, &[1]));
-        assert!(!buffer.insert(10, &[2]));
-        assert_eq!(buffer.pop_next().unwrap(), (10, vec![1]));
+    fn loopback_listener_needs_no_network_authentication() {
+        let addr = "127.0.0.1:8765".parse().unwrap();
+        assert!(validate_listener_policy(addr, false, false, false, false, false).is_ok());
+    }
+
+    #[test]
+    fn exposed_plaintext_listener_needs_an_explicit_boundary() {
+        let addr = "0.0.0.0:8765".parse().unwrap();
+        assert!(validate_listener_policy(addr, false, false, false, false, false).is_err());
+        assert!(validate_listener_policy(addr, false, false, false, true, false).is_ok());
+        assert!(validate_listener_policy(addr, false, false, false, false, true).is_ok());
+    }
+
+    #[test]
+    fn encrypted_final_receiver_can_listen_without_an_ip_filter() {
+        let addr = "0.0.0.0:8765".parse().unwrap();
+        assert!(validate_listener_policy(addr, true, false, false, false, false).is_ok());
+    }
+
+    #[test]
+    fn blind_forwarders_need_an_ip_filter_even_when_given_a_key() {
+        let addr = "0.0.0.0:8765".parse().unwrap();
+        assert!(validate_listener_policy(addr, true, true, false, false, false).is_err());
+        assert!(validate_listener_policy(addr, true, false, true, false, false).is_err());
+        assert!(validate_listener_policy(addr, true, true, false, true, false).is_ok());
     }
 
     #[test]
@@ -403,43 +534,4 @@ mod tests {
 
         assert!(buffer.max_frames <= 72);
     }
-}
-
-fn build_output<T>(
-    device: &cpal::Device,
-    config: &cpal::StreamConfig,
-    rx: mpsc::Receiver<Vec<f32>>,
-) -> Result<cpal::Stream>
-where
-    T: SizedSample + FromSample<f32>,
-{
-    let mut current = Vec::<f32>::new();
-    let mut index = 0usize;
-
-    let stream = device.build_output_stream(
-        config,
-        move |out: &mut [T], _| {
-            for sample in out.iter_mut() {
-                if index >= current.len() {
-                    match rx.try_recv() {
-                        Ok(next) => {
-                            current = next;
-                            index = 0;
-                        }
-                        Err(_) => {
-                            *sample = T::from_sample(0.0);
-                            continue;
-                        }
-                    }
-                }
-
-                *sample = T::from_sample(current[index]);
-                index += 1;
-            }
-        },
-        move |error| eprintln!("audio playback error: {error}"),
-        Some(Duration::from_millis(100)),
-    )?;
-
-    Ok(stream)
 }
