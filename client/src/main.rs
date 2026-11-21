@@ -239,7 +239,7 @@ fn ship_frame(
         };
         let ciphertext = encrypt_payload(key, &header, &scratch.encoded[..encoded_len])
             .context("could not encrypt audio frame")?;
-        header.encode(&ciphertext, &mut scratch.packet);
+        header.encode(&ciphertext, &mut scratch.packet)?;
     } else {
         let header = PacketHeader {
             sequence,
@@ -250,7 +250,7 @@ fn ship_frame(
             flags: 0,
             nonce: [0u8; NONCE_LEN],
         };
-        header.encode(&scratch.encoded[..encoded_len], &mut scratch.packet);
+        header.encode(&scratch.encoded[..encoded_len], &mut scratch.packet)?;
     }
 
     match socket.send(&scratch.packet) {
