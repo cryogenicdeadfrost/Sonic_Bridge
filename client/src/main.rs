@@ -4,7 +4,7 @@ use flexaudio::{OutputFormat, SourceKind, StreamConfig, open};
 use rusty_opus::{Application, OpusEncoder};
 use sonic_bridge_shared::{
     CHANNELS, FLAG_ENCRYPTED, FRAME_MS, FRAME_SAMPLES, NONCE_LEN, PacketHeader, SAMPLE_RATE,
-    encrypt_payload, parse_key_hex,
+    encrypt_payload, fresh_nonce, parse_key_hex,
 };
 use std::{net::UdpSocket, thread, time::Duration};
 
@@ -34,7 +34,7 @@ struct Args {
 fn main() -> Result<()> {
     let args = Args::parse();
 
-    eprintln!("SonicBridge client v0.2");
+    eprintln!("SonicBridge client v0.3");
     eprintln!("Target: {}", args.target);
     eprintln!("Bitrate: {} bps", args.bitrate);
     eprintln!("Packet TTL: {}", args.ttl);
@@ -82,9 +82,8 @@ fn main() -> Result<()> {
     }
 
     let mut sequence = 0u32;
-    let mut encoded = [0u8; 1500];
-    let mut encrypted = Vec::with_capacity(1600);
-    let mut packet = Vec::with_capacity(1700);
+    let mut encoded = [0u8; 1200];
+    let mut packet = Vec::with_capacity(1300);
     let expected_samples = FRAME_SAMPLES * CHANNELS as usize;
 
     loop {
@@ -107,23 +106,20 @@ fn main() -> Result<()> {
         packet.clear();
 
         if let Some(key) = key.as_ref() {
-            let (nonce, ciphertext) = encrypt_payload(key, &encoded[..encoded_len])
-                .context("could not encrypt audio frame")?;
-            encrypted.clear();
-            encrypted.extend_from_slice(&ciphertext);
-
-            PacketHeader {
+            let header = PacketHeader {
                 sequence,
                 sample_rate: SAMPLE_RATE,
                 channels: CHANNELS,
                 frame_ms: FRAME_MS,
                 ttl: args.ttl,
                 flags: FLAG_ENCRYPTED,
-                nonce,
-            }
-            .encode(&encrypted, &mut packet);
+                nonce: fresh_nonce(),
+            };
+            let ciphertext = encrypt_payload(key, &header, &encoded[..encoded_len])
+                .context("could not encrypt audio frame")?;
+            header.encode(&ciphertext, &mut packet);
         } else {
-            PacketHeader {
+            let header = PacketHeader {
                 sequence,
                 sample_rate: SAMPLE_RATE,
                 channels: CHANNELS,
@@ -131,8 +127,8 @@ fn main() -> Result<()> {
                 ttl: args.ttl,
                 flags: 0,
                 nonce: [0u8; NONCE_LEN],
-            }
-            .encode(&encoded[..encoded_len], &mut packet);
+            };
+            header.encode(&encoded[..encoded_len], &mut packet);
         }
 
         socket
