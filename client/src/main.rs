@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use flexaudio::{OutputFormat, SourceKind, StreamConfig, open};
 use rusty_opus::{Application, OpusEncoder};
-use sonic_bridge_shared::{CHANNELS, FRAME_MS, FRAME_SAMPLES, PacketHeader, SAMPLE_RATE};
+use sonic_bridge_shared::{encrypt_payload, parse_key_hex, CHANNELS, FLAG_ENCRYPTED, FRAME_MS, FRAME_SAMPLES, PacketHeader, SAMPLE_RATE, NONCE_LEN};
 use std::{net::UdpSocket, thread, time::Duration};
 
 #[derive(Parser, Debug)]
@@ -22,6 +22,10 @@ struct Args {
     /// Maximum number of relay hops before the packet is discarded.
     #[arg(long, default_value_t = 8)]
     ttl: u8,
+
+    /// Optional 256-bit key as 64 hexadecimal characters.
+    #[arg(long, env = "SONIC_BRIDGE_KEY")]
+    key_hex: Option<String>,
 }
 
 fn main() -> Result<()> {
@@ -61,9 +65,23 @@ fn main() -> Result<()> {
     encoder.use_cbr = false;
     encoder.use_dtx = true;
 
+    let key = args
+        .key_hex
+        .as_deref()
+        .map(parse_key_hex)
+        .transpose()
+        .context("invalid SonicBridge encryption key")?;
+
+    if key.is_some() {
+        eprintln!("Audio encryption: XChaCha20-Poly1305");
+    } else {
+        eprintln!("Audio encryption: disabled");
+    }
+
     let mut sequence = 0u32;
     let mut encoded = [0u8; 1500];
-    let mut packet = Vec::with_capacity(1500);
+    let mut encrypted = Vec::with_capacity(1600);
+    let mut packet = Vec::with_capacity(1700);
     let expected_samples = FRAME_SAMPLES * CHANNELS as usize;
 
     loop {
@@ -83,14 +101,36 @@ fn main() -> Result<()> {
             .encode(&chunk.data, FRAME_SAMPLES, &mut encoded)
             .context("Opus encoding failed")?;
 
-        PacketHeader {
-            sequence,
-            sample_rate: SAMPLE_RATE,
-            channels: CHANNELS,
-            frame_ms: FRAME_MS,
-            ttl: args.ttl,
+        packet.clear();
+
+        if let Some(key) = key.as_ref() {
+            let (nonce, ciphertext) = encrypt_payload(key, &encoded[..encoded_len])
+                .context("could not encrypt audio frame")?;
+            encrypted.clear();
+            encrypted.extend_from_slice(&ciphertext);
+
+            PacketHeader {
+                sequence,
+                sample_rate: SAMPLE_RATE,
+                channels: CHANNELS,
+                frame_ms: FRAME_MS,
+                ttl: args.ttl,
+                flags: FLAG_ENCRYPTED,
+                nonce,
+            }
+            .encode(&encrypted, &mut packet);
+        } else {
+            PacketHeader {
+                sequence,
+                sample_rate: SAMPLE_RATE,
+                channels: CHANNELS,
+                frame_ms: FRAME_MS,
+                ttl: args.ttl,
+                flags: 0,
+                nonce: [0u8; NONCE_LEN],
+            }
+            .encode(&encoded[..encoded_len], &mut packet);
         }
-        .encode(&encoded[..encoded_len], &mut packet);
 
         socket
             .send(&packet)
