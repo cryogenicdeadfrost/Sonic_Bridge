@@ -134,15 +134,21 @@ A simple chain looks like:
 
 Pi #1:
 
-    sonic-bridge-server       --listen 0.0.0.0:8765       --forward-to 100.64.0.11:8765       --relay-only
+    sonic-bridge-server \
+      --listen 0.0.0.0:8765 \
+      --forward-to 100.64.0.11:8765 \
+      --relay-only
 
 Pi #2:
 
-    sonic-bridge-server       --listen 0.0.0.0:8765       --forward-to 100.64.0.12:8765       --relay-only
+    sonic-bridge-server \
+      --listen 0.0.0.0:8765 \
+      --forward-to 100.64.0.12:8765 \
+      --relay-only
 
 Pi #3:
 
-    sonic-bridge-server       --listen 0.0.0.0:8765
+    sonic-bridge-server --listen 0.0.0.0:8765
 
 The client sends to Pi #1.
 
@@ -154,7 +160,7 @@ This is deliberately primitive. Primitive is good when the alternative is debugg
 
 Version 0.3 adds optional authenticated encryption for the audio payload.
 
-The primitive is XChaCha20-Poly1305 from RustCrypto. It is a pure-Rust AEAD implementation with a 192-bit nonce, which gives us a large nonce space without making the Pi run a heavyweight crypto stack. citeturn405635search0turn486953search2
+The primitive is XChaCha20-Poly1305 from RustCrypto. It is a pure-Rust AEAD implementation with a 192-bit nonce, which gives us a large nonce space without making the Pi run a heavyweight crypto stack.
 
 Enable it on the client:
 
@@ -168,15 +174,17 @@ and configure the same 64-hex-character key on the receiver:
       --listen 0.0.0.0:8765 \
       --key-hex 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
 
-The GUI exposes the same key as a masked field.
+The GUI exposes the same key as a masked field and passes it to the daemon through its environment rather than placing it in the child process command line.
 
-A relay does not need the key. It forwards the authenticated ciphertext and only changes the packet TTL. This means the chain can remain:
+A relay does not need the key. It forwards the authenticated ciphertext and only changes the packet TTL. The audio-format fields, sequence number, flags, protocol version, and nonce are authenticated as associated data. TTL is deliberately excluded because each relay must decrement it. This means the chain can remain:
 
     PC -> encrypted Pi #1 -> encrypted Pi #2 -> encrypted Pi #3 -> Bluetooth
 
 Without a configured key, v0.3 retains plaintext operation for local development and compatibility testing.
 
-The key is deliberately passed as an argument or environment variable in this release. Do not put a real production key in a committed README, shell history, or public configuration file.
+The key can be supplied through `--key-hex` or `SONIC_BRIDGE_KEY`. Prefer the environment variable for interactive use so the secret is not visible in the process command line. Do not put a real key in a committed README, shell history, or public configuration file.
+
+The v0.3 packet format is not wire-compatible with v0.2. Upgrade the client, every relay, and the final receiver together.
 
 ## Runtime statistics
 
@@ -229,7 +237,7 @@ The first version delivered packets almost immediately.
 
 That is nice until Wi-Fi decides that packet 381 should take the scenic route.
 
-Version 0.3 adds a small configurable packet-depth jitter buffer. The default is 60 ms.
+Version 0.3 adds a configurable packet-depth jitter buffer. The default target is 60 ms. Its memory is bounded: the target depth is capped at 64 frames and the queue has at most eight additional frames of headroom. A large sequence jump resets the buffer near the new stream position instead of allowing packets to accumulate indefinitely.
 
 The receiver can trade latency for resilience:
 
@@ -249,7 +257,7 @@ The client now uses the native system-output capture path exposed through flexau
 
 That is important because the original implementation treated CPAL's normal input-device API as if it automatically meant WASAPI loopback. It was a clever assumption. It was also the sort of assumption that eventually bites you.
 
-Version 0.2 explicitly asks for system-output capture.
+Version 0.3 explicitly asks for system-output capture.
 
 The resulting pipeline is:
 
@@ -384,6 +392,9 @@ If the network is behind, the system should lose audio rather than slowly transf
 - [x] Authentication-failure counters
 - [x] Runtime receiver statistics
 - [x] Relay forwarding of encrypted packets without decrypting them
+- [x] Authenticated packet metadata (TTL excluded for relay mutation)
+- [x] Bounded jitter-buffer capacity and sequence-wrap handling
+- [x] Tests for packet authentication, relay TTL, and jitter ordering
 - [ ] BlueZ device discovery in the GUI
 - [ ] Automatic PipeWire Bluetooth sink selection
 - [ ] Latency and packet-loss dashboard
