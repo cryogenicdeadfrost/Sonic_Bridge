@@ -17,6 +17,7 @@ use std::{
 };
 
 const MAX_OPUS_FRAME_BYTES: usize = 1_275;
+const FRAME_LEN: usize = FRAME_SAMPLES * CHANNELS as usize;
 
 #[derive(Parser, Debug)]
 #[command(
@@ -115,8 +116,7 @@ fn main() -> Result<()> {
 
     let mut sequence = 0u32;
     let mut sent = 0u64;
-    let mut frame = [0.0f32; FRAME_SAMPLES * CHANNELS as usize];
-    let mut filled = 0usize;
+    let mut assembler = FrameAssembler::default();
     let mut encoded = [0u8; MAX_OPUS_FRAME_BYTES];
     let mut packet = Vec::with_capacity(1_350);
     let mut last_report = Instant::now();
@@ -127,30 +127,22 @@ fn main() -> Result<()> {
             continue;
         };
 
-        // Capture backends are free to hand us oddly-sized chunks. Opus isn't.
-        let mut offset = 0usize;
-        while offset < chunk.data.len() {
-            let take = (frame.len() - filled).min(chunk.data.len() - offset);
-            frame[filled..filled + take].copy_from_slice(&chunk.data[offset..offset + take]);
-            filled += take;
-            offset += take;
-
-            if filled == frame.len() {
-                ship_frame(
-                    &mut encoder,
-                    &frame,
-                    key.as_ref(),
-                    args.ttl,
-                    sequence,
-                    &mut encoded,
-                    &mut packet,
-                    &socket,
-                )?;
-                sequence = sequence.wrapping_add(1);
-                sent += 1;
-                filled = 0;
-            }
-        }
+        // Capture callback boundaries rarely line up with codec frame boundaries.
+        assembler.push(&chunk.data, |frame| {
+            ship_frame(
+                &mut encoder,
+                frame,
+                key.as_ref(),
+                args.ttl,
+                sequence,
+                &mut encoded,
+                &mut packet,
+                &socket,
+            )?;
+            sequence = sequence.wrapping_add(1);
+            sent += 1;
+            Ok(())
+        })?;
 
         if args.stats_interval > 0
             && last_report.elapsed() >= Duration::from_secs(args.stats_interval)
@@ -162,6 +154,98 @@ fn main() -> Result<()> {
 
     eprintln!("Stopped. Sent {sent} audio packets.");
     Ok(())
+}
+
+struct FrameAssembler {
+    samples: [f32; FRAME_LEN],
+    filled: usize,
+}
+
+impl Default for FrameAssembler {
+    fn default() -> Self {
+        Self {
+            samples: [0.0; FRAME_LEN],
+            filled: 0,
+        }
+    }
+}
+
+impl FrameAssembler {
+    fn push(
+        &mut self,
+        input: &[f32],
+        mut send_frame: impl FnMut(&[f32; FRAME_LEN]) -> Result<()>,
+    ) -> Result<()> {
+        let mut offset = 0;
+
+        while offset < input.len() {
+            let take = (FRAME_LEN - self.filled).min(input.len() - offset);
+            self.samples[self.filled..self.filled + take]
+                .copy_from_slice(&input[offset..offset + take]);
+            self.filled += take;
+            offset += take;
+
+            if self.filled == FRAME_LEN {
+                send_frame(&self.samples)?;
+                self.filled = 0;
+            }
+        }
+
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn capture_chunks_are_joined_into_complete_frames() {
+        let mut assembler = FrameAssembler::default();
+        let samples: Vec<f32> = (0..FRAME_LEN * 2).map(|n| n as f32).collect();
+        let mut frames = Vec::new();
+
+        for chunk in [
+            &samples[..17],
+            &samples[17..987],
+            &samples[987..1_400],
+            &samples[1_400..],
+        ] {
+            assembler
+                .push(chunk, |frame| {
+                    frames.push((frame[0], frame[FRAME_LEN - 1]));
+                    Ok(())
+                })
+                .unwrap();
+        }
+
+        assert_eq!(frames, vec![(0.0, (FRAME_LEN - 1) as f32), (FRAME_LEN as f32, (FRAME_LEN * 2 - 1) as f32)]);
+        assert_eq!(assembler.filled, 0);
+    }
+
+    #[test]
+    fn incomplete_capture_is_kept_until_the_next_chunk() {
+        let mut assembler = FrameAssembler::default();
+        let mut frames_sent = 0;
+
+        assembler
+            .push(&[1.0; FRAME_LEN - 1], |_| {
+                frames_sent += 1;
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(frames_sent, 0);
+
+        assembler
+            .push(&[2.0], |frame| {
+                frames_sent += 1;
+                assert_eq!(frame[0], 1.0);
+                assert_eq!(frame[FRAME_LEN - 1], 2.0);
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(frames_sent, 1);
+    }
 }
 
 fn ship_frame(
