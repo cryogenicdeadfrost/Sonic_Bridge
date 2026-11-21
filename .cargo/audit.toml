@@ -1,0 +1,12 @@
+# One narrow exception for a transitive crate used with fixed, non-panicking audio chunk types.
+#
+# RUSTSEC-2026-0293 affects Consumer::clear/skip when T::drop panics.
+# The only ringbuf consumers in our resolved graph are flexaudio-core's
+# HeapRb<AudioChunk> and HeapRb<SecondaryChunk>. Both types contain Vec<f32>
+# and scalar metadata only; neither has a custom Drop implementation or
+# user-supplied elements. A Vec<f32> drop cannot invoke user code or panic.
+# Revisit and remove this exception as soon as flexaudio-core accepts ringbuf
+# >= 0.5.2, or if either queue ever stores a panic-capable element type.
+
+[advisories]
+ignore = ["RUSTSEC-2026-0293"]
