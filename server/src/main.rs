@@ -337,6 +337,60 @@ fn main() -> Result<()> {
     }
 }
 
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn jitter_buffer_reorders_packets() {
+        let mut buffer = JitterBuffer::new(20);
+
+        assert!(buffer.insert(10, &[10]));
+        assert!(buffer.insert(12, &[12]));
+        assert!(buffer.insert(11, &[11]));
+
+        assert_eq!(buffer.pop_next().unwrap(), (10, vec![10]));
+        assert_eq!(buffer.pop_next().unwrap(), (11, vec![11]));
+        assert_eq!(buffer.pop_next().unwrap(), (12, vec![12]));
+    }
+
+    #[test]
+    fn jitter_buffer_handles_sequence_wraparound() {
+        let mut buffer = JitterBuffer::new(20);
+
+        assert!(buffer.insert(u32::MAX - 1, &[1]));
+        assert!(buffer.insert(0, &[3]));
+        assert!(buffer.insert(u32::MAX, &[2]));
+
+        assert_eq!(
+            buffer.pop_next().unwrap(),
+            (u32::MAX - 1, vec![1])
+        );
+        assert_eq!(buffer.pop_next().unwrap(), (u32::MAX, vec![2]));
+        assert_eq!(buffer.pop_next().unwrap(), (0, vec![3]));
+    }
+
+    #[test]
+    fn jitter_buffer_rejects_old_packets() {
+        let mut buffer = JitterBuffer::new(20);
+        assert!(buffer.insert(100, &[1]));
+        assert!(!buffer.insert(99, &[2]));
+    }
+
+    #[test]
+    fn jitter_buffer_memory_is_bounded() {
+        let mut buffer = JitterBuffer::new(u32::MAX);
+
+        for sequence in 0..100_000u32 {
+            let _ = buffer.insert(sequence, &[0u8; 128]);
+            assert!(buffer.packets.len() <= buffer.max_frames);
+        }
+
+        assert!(buffer.max_frames <= 72);
+    }
+}
+
 fn build_output<T>(
     device: &cpal::Device,
     config: &cpal::StreamConfig,
