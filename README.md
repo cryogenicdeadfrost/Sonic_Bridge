@@ -124,6 +124,14 @@ $env:SONIC_BRIDGE_KEY = "<64 hex characters>"
 .\target\release\sonic-bridge-client.exe --bitrate 96000 --ttl 8
 ```
 
+Windows Command Prompt (cmd.exe):
+
+```bat
+set "SONIC_BRIDGE_TARGET=100.64.0.10:8765"
+set "SONIC_BRIDGE_KEY=<64 hex characters>"
+target\release\sonic-bridge-client.exe --bitrate 96000 --ttl 8
+```
+
 Linux / macOS shell:
 
 ```sh
