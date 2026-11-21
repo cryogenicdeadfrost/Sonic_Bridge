@@ -4,7 +4,8 @@ use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{FromSample, SizedSample};
 use rusty_opus::OpusDecoder;
 use sonic_bridge_shared::{
-    CHANNELS, FRAME_MS, FRAME_SAMPLES, PacketHeader, SAMPLE_RATE, decrypt_payload, parse_key_hex,
+    CHANNELS, FRAME_MS, FRAME_SAMPLES, MAX_PACKET_SIZE, PacketHeader, SAMPLE_RATE, decrypt_payload,
+    parse_key_hex,
 };
 use std::{
     collections::BTreeMap,
@@ -86,9 +87,11 @@ impl JitterBuffer {
             return false;
         }
 
-        self.packets
-            .entry(sequence)
-            .or_insert_with(|| payload.to_vec());
+        if self.packets.contains_key(&sequence) {
+            return false;
+        }
+
+        self.packets.insert(sequence, payload.to_vec());
         true
     }
 
@@ -204,7 +207,7 @@ fn main() -> Result<()> {
     };
 
     let mut jitter = JitterBuffer::new(args.jitter_ms);
-    let mut buf = [0u8; 2048];
+    let mut buf = [0u8; MAX_PACKET_SIZE];
     let mut decoded = vec![0.0f32; FRAME_SAMPLES * CHANNELS as usize];
 
     let mut received = 0u64;
@@ -249,7 +252,7 @@ fn main() -> Result<()> {
         if let (Some(target), Some(relay_socket)) = (&args.forward_to, &forward_socket) {
             if let Some(next_header) = header.decremented_ttl() {
                 let mut relay_packet = Vec::with_capacity(len);
-                next_header.encode(payload, &mut relay_packet);
+                next_header.encode(payload, &mut relay_packet)?;
 
                 if relay_socket.send_to(&relay_packet, target).is_ok() {
                     forwarded += 1;
@@ -347,6 +350,14 @@ fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn jitter_buffer_rejects_duplicate_packets() {
+        let mut buffer = JitterBuffer::new(20);
+        assert!(buffer.insert(10, &[1]));
+        assert!(!buffer.insert(10, &[2]));
+        assert_eq!(buffer.pop_next().unwrap(), (10, vec![1]));
+    }
 
     #[test]
     fn jitter_buffer_reorders_packets() {
