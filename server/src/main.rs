@@ -48,11 +48,19 @@ struct Args {
     stats_interval: u64,
 
     /// Only accept datagrams from these source IP addresses.
-    #[arg(long = "allowed-peer", env = "SONIC_BRIDGE_ALLOWED_PEERS", value_delimiter = ',')]
+    #[arg(
+        long = "allowed-peer",
+        env = "SONIC_BRIDGE_ALLOWED_PEERS",
+        value_delimiter = ','
+    )]
     allowed_peers: Vec<IpAddr>,
 
     /// Explicitly allow unencrypted traffic on a non-loopback interface.
-    #[arg(long, env = "SONIC_BRIDGE_ALLOW_INSECURE_LISTEN", default_value_t = false)]
+    #[arg(
+        long,
+        env = "SONIC_BRIDGE_ALLOW_INSECURE_LISTEN",
+        default_value_t = false
+    )]
     allow_insecure_listen: bool,
 }
 
