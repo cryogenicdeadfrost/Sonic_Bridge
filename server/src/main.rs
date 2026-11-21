@@ -3,7 +3,9 @@ use clap::Parser;
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{FromSample, SizedSample};
 use rusty_opus::OpusDecoder;
-use sonic_bridge_shared::{decrypt_payload, parse_key_hex, CHANNELS, FRAME_MS, FRAME_SAMPLES, PacketHeader, SAMPLE_RATE};
+use sonic_bridge_shared::{
+    CHANNELS, FRAME_MS, FRAME_SAMPLES, PacketHeader, SAMPLE_RATE, decrypt_payload, parse_key_hex,
+};
 use std::{
     collections::BTreeMap,
     net::UdpSocket,
