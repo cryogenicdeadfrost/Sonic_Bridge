@@ -48,29 +48,46 @@ struct JitterBuffer {
     packets: BTreeMap<u32, Vec<u8>>,
     next_sequence: Option<u32>,
     target_frames: usize,
+    max_frames: usize,
 }
 
 impl JitterBuffer {
     fn new(jitter_ms: u32) -> Self {
+        let target_frames = ((jitter_ms as usize + FRAME_MS as usize - 1)
+            / FRAME_MS as usize)
+            .clamp(1, 64);
+
         Self {
             packets: BTreeMap::new(),
             next_sequence: None,
-            target_frames: (jitter_ms / FRAME_MS as u32).max(1) as usize,
+            target_frames,
+            max_frames: target_frames + 8,
         }
     }
 
-    fn insert(&mut self, sequence: u32, payload: &[u8]) {
-        if self.next_sequence.is_none() {
-            self.next_sequence = Some(sequence);
+    fn insert(&mut self, sequence: u32, payload: &[u8]) -> bool {
+        let next = *self.next_sequence.get_or_insert(sequence);
+        let distance = sequence.wrapping_sub(next);
+
+        if distance >= 0x8000_0000 {
+            return false;
         }
 
-        if let Some(next) = self.next_sequence {
-            if sequence.wrapping_sub(next) < 0x8000_0000 {
-                self.packets
-                    .entry(sequence)
-                    .or_insert_with(|| payload.to_vec());
-            }
+        if distance as usize >= self.max_frames {
+            self.packets.clear();
+            self.next_sequence = Some(
+                sequence.wrapping_sub(self.target_frames.saturating_sub(1) as u32),
+            );
         }
+
+        if self.packets.len() >= self.max_frames && !self.packets.contains_key(&sequence) {
+            return false;
+        }
+
+        self.packets
+            .entry(sequence)
+            .or_insert_with(|| payload.to_vec());
+        true
     }
 
     fn ready(&self) -> bool {
@@ -155,7 +172,7 @@ fn main() -> Result<()> {
         (None, None)
     };
 
-    eprintln!("SonicBridge server v0.2");
+    eprintln!("SonicBridge server v0.3");
     eprintln!("Listening on {}", args.listen);
     eprintln!(
         "Relay target: {}",
@@ -234,20 +251,30 @@ fn main() -> Result<()> {
         }
 
         if args.relay_only {
+            if last_report.elapsed() >= Duration::from_secs(args.stats_interval.max(1)) {
+                eprintln!(
+                    "stats: rx={} forwarded={} concealed={} dropped={} auth_failed={} jitter={}",
+                    received,
+                    forwarded,
+                    concealed,
+                    dropped,
+                    auth_failed,
+                    jitter.packets.len()
+                );
+                last_report = Instant::now();
+            }
             continue;
         }
 
-        let decrypted_payload;
-
-        if header.encrypted() {
+        let decrypted_payload = if header.encrypted() {
             if let Some(key) = key.as_ref() {
-                decrypted_payload = match decrypt_payload(key, &header.nonce, payload) {
+                match decrypt_payload(key, &header, payload) {
                     Ok(value) => value,
                     Err(_) => {
                         auth_failed += 1;
                         continue;
                     }
-                };
+                }
             } else {
                 dropped += 1;
                 continue;
@@ -257,10 +284,13 @@ fn main() -> Result<()> {
                 auth_failed += 1;
                 continue;
             }
-            decrypted_payload = payload.to_vec();
-        }
+            payload.to_vec()
+        };
 
-        jitter.insert(header.sequence, &decrypted_payload);
+        if !jitter.insert(header.sequence, &decrypted_payload) {
+            dropped += 1;
+            continue;
+        }
 
         while let Some((_sequence, packet)) = jitter.pop_next() {
             if packet.is_empty() {
