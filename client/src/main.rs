@@ -1,4 +1,4 @@
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use clap::Parser;
 use flexaudio::{OutputFormat, SourceKind, StreamConfig, open};
 use rusty_opus::{Application, OpusEncoder};
@@ -105,7 +105,11 @@ fn main() -> Result<()> {
     eprintln!("Packet TTL: {}", args.ttl);
     eprintln!(
         "Audio encryption: {}",
-        if key.is_some() { "XChaCha20-Poly1305" } else { "disabled" }
+        if key.is_some() {
+            "XChaCha20-Poly1305"
+        } else {
+            "disabled"
+        }
     );
     eprintln!("Press Ctrl+C to stop.");
 
@@ -200,8 +204,6 @@ fn ship_frame(
         header.encode(&encoded[..encoded_len], packet);
     }
 
-    socket
-        .send(packet)
-        .context("could not send audio packet")?;
+    socket.send(packet).context("could not send audio packet")?;
     Ok(())
 }
