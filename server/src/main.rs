@@ -3,7 +3,7 @@ use clap::Parser;
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{FromSample, SizedSample};
 use rusty_opus::OpusDecoder;
-use sonic_bridge_shared::{CHANNELS, FRAME_MS, FRAME_SAMPLES, PacketHeader, SAMPLE_RATE};
+use sonic_bridge_shared::{decrypt_payload, parse_key_hex, CHANNELS, FRAME_MS, FRAME_SAMPLES, PacketHeader, SAMPLE_RATE};
 use std::{
     collections::BTreeMap,
     net::UdpSocket,
@@ -32,6 +32,14 @@ struct Args {
     /// Packet buffering before playback, in milliseconds.
     #[arg(long, default_value_t = 60)]
     jitter_ms: u32,
+
+    /// Optional 256-bit key as 64 hexadecimal characters.
+    #[arg(long, env = "SONIC_BRIDGE_KEY")]
+    key_hex: Option<String>,
+
+    /// Print receiver statistics at this interval.
+    #[arg(long, default_value_t = 5)]
+    stats_interval: u64,
 }
 
 struct JitterBuffer {
@@ -84,6 +92,13 @@ impl JitterBuffer {
 
 fn main() -> Result<()> {
     let args = Args::parse();
+
+    let key = args
+        .key_hex
+        .as_deref()
+        .map(parse_key_hex)
+        .transpose()
+        .context("invalid SonicBridge encryption key")?;
 
     let socket =
         UdpSocket::bind(&args.listen).context("could not bind the SonicBridge UDP socket")?;
@@ -170,6 +185,7 @@ fn main() -> Result<()> {
     let mut forwarded = 0u64;
     let mut concealed = 0u64;
     let mut dropped = 0u64;
+    let mut auth_failed = 0u64;
     let mut last_report = Instant::now();
 
     loop {
@@ -219,7 +235,30 @@ fn main() -> Result<()> {
             continue;
         }
 
-        jitter.insert(header.sequence, payload);
+        let decrypted_payload;
+
+        if header.encrypted() {
+            if let Some(key) = key.as_ref() {
+                decrypted_payload = match decrypt_payload(key, &header.nonce, payload) {
+                    Ok(value) => value,
+                    Err(_) => {
+                        auth_failed += 1;
+                        continue;
+                    }
+                };
+            } else {
+                dropped += 1;
+                continue;
+            }
+        } else {
+            if key.is_some() {
+                auth_failed += 1;
+                continue;
+            }
+            decrypted_payload = payload.to_vec();
+        }
+
+        jitter.insert(header.sequence, &decrypted_payload);
 
         while let Some((_sequence, packet)) = jitter.pop_next() {
             if packet.is_empty() {
@@ -245,10 +284,15 @@ fn main() -> Result<()> {
             }
         }
 
-        if last_report.elapsed() >= Duration::from_secs(5) {
+        if last_report.elapsed() >= Duration::from_secs(args.stats_interval.max(1)) {
             eprintln!(
-                "stats: rx={} forwarded={} concealed={} dropped={}",
-                received, forwarded, concealed, dropped
+                "stats: rx={} forwarded={} concealed={} dropped={} auth_failed={} jitter={}",
+                received,
+                forwarded,
+                concealed,
+                dropped,
+                auth_failed,
+                jitter.packets.len()
             );
             last_report = Instant::now();
         }
