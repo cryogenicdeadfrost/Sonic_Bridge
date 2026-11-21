@@ -326,7 +326,7 @@ fn main() -> Result<()> {
             header.decremented_ttl(),
         ) {
             let mut relay_packet = Vec::with_capacity(len);
-            next_header.encode(payload, &mut relay_packet);
+            next_header.encode(payload, &mut relay_packet)?;
 
             if relay_socket.send_to(&relay_packet, target).is_ok() {
                 forwarded += 1;
