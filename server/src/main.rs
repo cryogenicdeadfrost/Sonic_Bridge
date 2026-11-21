@@ -101,7 +101,7 @@ struct JitterBuffer {
 impl JitterBuffer {
     fn new(jitter_ms: u32) -> Self {
         let target_frames =
-            ((jitter_ms as usize + FRAME_MS as usize - 1) / FRAME_MS as usize).clamp(1, 64);
+            (jitter_ms as usize).div_ceil(FRAME_MS as usize).clamp(1, 64);
 
         Self {
             packets: BTreeMap::new(),
@@ -319,14 +319,16 @@ fn main() -> Result<()> {
 
         received += 1;
 
-        if let (Some(target), Some(relay_socket)) = (&args.forward_to, &forward_socket) {
-            if let Some(next_header) = header.decremented_ttl() {
-                let mut relay_packet = Vec::with_capacity(len);
-                next_header.encode(payload, &mut relay_packet);
+        if let (Some(target), Some(relay_socket), Some(next_header)) = (
+            args.forward_to.as_ref(),
+            forward_socket.as_ref(),
+            header.decremented_ttl(),
+        ) {
+            let mut relay_packet = Vec::with_capacity(len);
+            next_header.encode(payload, &mut relay_packet);
 
-                if relay_socket.send_to(&relay_packet, target).is_ok() {
-                    forwarded += 1;
-                }
+            if relay_socket.send_to(&relay_packet, target).is_ok() {
+                forwarded += 1;
             }
         }
 
@@ -374,12 +376,14 @@ fn main() -> Result<()> {
 
         while let Some((_sequence, packet)) = jitter.pop_next() {
             if packet.is_empty() {
-                if let Some(decoder) = decoder.as_mut() {
-                    if decoder.decode(&[], FRAME_SAMPLES, &mut decoded).is_ok() {
-                        if tx.as_ref().unwrap().try_send(decoded.clone()).is_ok() {
-                            concealed += 1;
-                        }
+                match (decoder.as_mut(), tx.as_ref()) {
+                    (Some(decoder), Some(tx))
+                        if decoder.decode(&[], FRAME_SAMPLES, &mut decoded).is_ok()
+                            && tx.try_send(decoded.clone()).is_ok() =>
+                    {
+                        concealed += 1;
                     }
+                    _ => {}
                 }
                 continue;
             }
@@ -415,6 +419,45 @@ fn main() -> Result<()> {
     );
     drop(_stream);
     Ok(())
+}
+
+fn build_output<T>(
+    device: &cpal::Device,
+    config: &cpal::StreamConfig,
+    rx: mpsc::Receiver<Vec<f32>>,
+) -> Result<cpal::Stream>
+where
+    T: SizedSample + FromSample<f32>,
+{
+    let mut current = Vec::<f32>::new();
+    let mut index = 0usize;
+
+    let stream = device.build_output_stream(
+        config,
+        move |out: &mut [T], _| {
+            for sample in out.iter_mut() {
+                if index >= current.len() {
+                    match rx.try_recv() {
+                        Ok(next) => {
+                            current = next;
+                            index = 0;
+                        }
+                        Err(_) => {
+                            *sample = T::from_sample(0.0);
+                            continue;
+                        }
+                    }
+                }
+
+                *sample = T::from_sample(current[index]);
+                index += 1;
+            }
+        },
+        move |error| eprintln!("audio playback error: {error}"),
+        Some(Duration::from_millis(100)),
+    )?;
+
+    Ok(stream)
 }
 
 #[cfg(test)]
@@ -493,43 +536,4 @@ mod tests {
 
         assert!(buffer.max_frames <= 72);
     }
-}
-
-fn build_output<T>(
-    device: &cpal::Device,
-    config: &cpal::StreamConfig,
-    rx: mpsc::Receiver<Vec<f32>>,
-) -> Result<cpal::Stream>
-where
-    T: SizedSample + FromSample<f32>,
-{
-    let mut current = Vec::<f32>::new();
-    let mut index = 0usize;
-
-    let stream = device.build_output_stream(
-        config,
-        move |out: &mut [T], _| {
-            for sample in out.iter_mut() {
-                if index >= current.len() {
-                    match rx.try_recv() {
-                        Ok(next) => {
-                            current = next;
-                            index = 0;
-                        }
-                        Err(_) => {
-                            *sample = T::from_sample(0.0);
-                            continue;
-                        }
-                    }
-                }
-
-                *sample = T::from_sample(current[index]);
-                index += 1;
-            }
-        },
-        move |error| eprintln!("audio playback error: {error}"),
-        Some(Duration::from_millis(100)),
-    )?;
-
-    Ok(stream)
 }
