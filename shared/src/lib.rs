@@ -20,6 +20,11 @@ pub const AAD_LEN: usize = 40;
 // magic(4) + version(1) + channels(1) + frame_ms(1) + ttl(1)
 // + flags(1) + sequence(4) + sample_rate(4) + nonce(24) + payload_len(2)
 pub const HEADER_LEN: usize = 43;
+pub const MAX_OPUS_PAYLOAD_LEN: usize = 1_275;
+pub const AEAD_TAG_LEN: usize = 16;
+pub const MAX_PACKET_PAYLOAD_LEN: usize = MAX_OPUS_PAYLOAD_LEN + AEAD_TAG_LEN;
+pub const MAX_PACKET_SIZE: usize = HEADER_LEN + MAX_PACKET_PAYLOAD_LEN;
+pub const MAX_TTL: u8 = 32;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PacketHeader {
@@ -33,7 +38,33 @@ pub struct PacketHeader {
 }
 
 impl PacketHeader {
-    pub fn encode(self, payload: &[u8], out: &mut Vec<u8>) {
+    pub fn encode(self, payload: &[u8], out: &mut Vec<u8>) -> io::Result<()> {
+        let max_payload_len = if self.encrypted() {
+            MAX_PACKET_PAYLOAD_LEN
+        } else {
+            MAX_OPUS_PAYLOAD_LEN
+        };
+
+        if self.flags & !FLAG_ENCRYPTED != 0
+            || self.ttl > MAX_TTL
+            || self.sample_rate != SAMPLE_RATE
+            || self.channels != CHANNELS
+            || self.frame_ms != FRAME_MS
+            || payload.len() > max_payload_len
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "SonicBridge packet exceeds its protocol limits",
+            ));
+        }
+
+        let payload_len = u16::try_from(payload.len()).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "SonicBridge payload length does not fit in the packet header",
+            )
+        })?;
+
         out.clear();
         out.reserve(HEADER_LEN + payload.len());
 
@@ -46,8 +77,9 @@ impl PacketHeader {
         out.extend_from_slice(&self.sequence.to_be_bytes());
         out.extend_from_slice(&self.sample_rate.to_be_bytes());
         out.extend_from_slice(&self.nonce);
-        out.extend_from_slice(&(payload.len() as u16).to_be_bytes());
+        out.extend_from_slice(&payload_len.to_be_bytes());
         out.extend_from_slice(payload);
+        Ok(())
     }
 
     pub fn decode(buf: &[u8]) -> io::Result<(Self, &[u8])> {
@@ -65,7 +97,27 @@ impl PacketHeader {
             ));
         }
 
+        let sample_rate = u32::from_be_bytes(buf[13..17].try_into().unwrap());
+        if sample_rate != SAMPLE_RATE || buf[5] != CHANNELS || buf[6] != FRAME_MS {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "unsupported SonicBridge audio format",
+            ));
+        }
+
         let payload_len = u16::from_be_bytes([buf[41], buf[42]]) as usize;
+        let max_payload_len = if buf[8] & FLAG_ENCRYPTED != 0 {
+            MAX_PACKET_PAYLOAD_LEN
+        } else {
+            MAX_OPUS_PAYLOAD_LEN
+        };
+
+        if buf[7] > MAX_TTL || payload_len > max_payload_len {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "SonicBridge packet exceeds its protocol limits",
+            ));
+        }
 
         if buf.len() != HEADER_LEN + payload_len {
             return Err(io::Error::new(
@@ -122,9 +174,9 @@ impl PacketHeader {
 }
 
 pub fn parse_key_hex(value: &str) -> io::Result<[u8; 32]> {
-    let value = value.trim();
+    let bytes = value.trim().as_bytes();
 
-    if value.len() != 64 {
+    if bytes.len() != 64 || !bytes.iter().all(u8::is_ascii_hexdigit) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             "SonicBridge keys must contain exactly 64 hexadecimal characters",
@@ -135,15 +187,21 @@ pub fn parse_key_hex(value: &str) -> io::Result<[u8; 32]> {
 
     for (index, byte) in key.iter_mut().enumerate() {
         let offset = index * 2;
-        *byte = u8::from_str_radix(&value[offset..offset + 2], 16).map_err(|_| {
-            io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "SonicBridge key contains non-hexadecimal characters",
-            )
-        })?;
+        let high = hex_nibble(bytes[offset]).expect("validated hexadecimal key");
+        let low = hex_nibble(bytes[offset + 1]).expect("validated hexadecimal key");
+        *byte = (high << 4) | low;
     }
 
     Ok(key)
+}
+
+fn hex_nibble(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
 }
 
 pub fn fresh_nonce() -> [u8; NONCE_LEN] {
@@ -207,12 +265,27 @@ mod tests {
     }
 
     #[test]
+    fn key_parser_accepts_uppercase_and_lowercase_hex() {
+        assert_eq!(parse_key_hex(&"aB".repeat(32)).unwrap(), [0xAB; 32]);
+    }
+
+    #[test]
+    fn key_parser_rejects_non_ascii_without_panicking() {
+        let invalid = format!("€{}", "0".repeat(61));
+        assert_eq!(invalid.len(), 64);
+        assert_eq!(
+            parse_key_hex(&invalid).unwrap_err().kind(),
+            io::ErrorKind::InvalidInput
+        );
+    }
+
+    #[test]
     fn packet_round_trip() {
         let header = test_header();
         let payload = [1, 2, 3, 4];
         let mut packet = Vec::new();
 
-        header.encode(&payload, &mut packet);
+        header.encode(&payload, &mut packet).unwrap();
 
         let (decoded, body) = PacketHeader::decode(&packet).unwrap();
 
@@ -276,7 +349,7 @@ mod tests {
     fn trailing_packet_bytes_are_rejected() {
         let header = test_header();
         let mut packet = Vec::new();
-        header.encode(&[1, 2, 3], &mut packet);
+        header.encode(&[1, 2, 3], &mut packet).unwrap();
         packet.push(4);
 
         assert_eq!(
@@ -286,11 +359,76 @@ mod tests {
     }
 
     #[test]
+    fn unsupported_audio_formats_are_rejected() {
+        for (offset, value) in [(5, 1), (6, 40), (16, 1)] {
+            let header = test_header();
+            let mut packet = Vec::new();
+            header.encode(&[1, 2, 3], &mut packet).unwrap();
+            packet[offset] = value;
+
+            assert_eq!(
+                PacketHeader::decode(&packet).unwrap_err().kind(),
+                io::ErrorKind::InvalidData
+            );
+        }
+    }
+
+    #[test]
     fn unsupported_flags_are_rejected() {
         let header = test_header();
         let mut packet = Vec::new();
-        header.encode(&[1, 2, 3], &mut packet);
+        header.encode(&[1, 2, 3], &mut packet).unwrap();
         packet[8] = 0x80;
+
+        assert_eq!(
+            PacketHeader::decode(&packet).unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
+    }
+
+    #[test]
+    fn oversized_opus_payload_is_rejected() {
+        let header = PacketHeader {
+            flags: 0,
+            nonce: [0u8; NONCE_LEN],
+            ..test_header()
+        };
+        let mut packet = Vec::new();
+        assert_eq!(
+            header
+                .encode(&vec![0u8; MAX_OPUS_PAYLOAD_LEN + 1], &mut packet)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::InvalidInput
+        );
+    }
+
+    #[test]
+    fn decoder_rejects_oversized_opus_payload() {
+        let header = PacketHeader {
+            flags: 0,
+            nonce: [0u8; NONCE_LEN],
+            ..test_header()
+        };
+        let mut packet = Vec::new();
+        header
+            .encode(&vec![0u8; MAX_OPUS_PAYLOAD_LEN], &mut packet)
+            .unwrap();
+        packet[41..43].copy_from_slice(&((MAX_OPUS_PAYLOAD_LEN + 1) as u16).to_be_bytes());
+        packet.push(0);
+
+        assert_eq!(
+            PacketHeader::decode(&packet).unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
+    }
+
+    #[test]
+    fn excessive_ttl_is_rejected() {
+        let header = test_header();
+        let mut packet = Vec::new();
+        header.encode(&[1, 2, 3], &mut packet).unwrap();
+        packet[7] = MAX_TTL + 1;
 
         assert_eq!(
             PacketHeader::decode(&packet).unwrap_err().kind(),
