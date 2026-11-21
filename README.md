@@ -112,6 +112,38 @@ The GUI does not replace the daemon. It controls it.
 
 That keeps the Pi installation tiny while still giving a desktop user an easy control surface.
 
+## Running the client from a terminal
+
+The command-line client is a first-class way to run SonicBridge. It does not need the desktop app.
+
+PowerShell:
+
+```powershell
+$env:SONIC_BRIDGE_TARGET = "100.64.0.10:8765"
+$env:SONIC_BRIDGE_KEY = "<64 hex characters>"
+.\target\release\sonic-bridge-client.exe --bitrate 96000 --ttl 8
+```
+
+Windows Command Prompt (cmd.exe):
+
+```bat
+set "SONIC_BRIDGE_TARGET=100.64.0.10:8765"
+set "SONIC_BRIDGE_KEY=<64 hex characters>"
+target\release\sonic-bridge-client.exe --bitrate 96000 --ttl 8
+```
+
+Linux / macOS shell:
+
+```sh
+SONIC_BRIDGE_TARGET=100.64.0.10:8765 \
+SONIC_BRIDGE_KEY="<64 hex characters>" \
+./target/release/sonic-bridge-client --bitrate 96000 --ttl 8
+```
+
+You can also pass `--target` and `--key-hex` directly. Prefer environment variables for secrets so the key does not appear in the process command line. Run `sonic-bridge-client --help` for the full option list. Press Ctrl+C to stop cleanly; the client prints a packet count before exiting.
+
+The client assembles capture chunks into exact 20 ms Opus frames. Audio APIs do not promise that every callback lands on a codec-frame boundary, so assuming they do is a good way to make tiny, mysterious dropouts.
+
 ## Multi-Pi chaining
 
 Every Pi runs the same receiver binary.

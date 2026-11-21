@@ -6,6 +6,7 @@ license.workspace = true
 
 [dependencies]
 anyhow.workspace = true
+ctrlc.workspace = true
 clap.workspace = true
 flexaudio.workspace = true
 rusty-opus.workspace = true
