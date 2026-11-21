@@ -53,9 +53,8 @@ struct JitterBuffer {
 
 impl JitterBuffer {
     fn new(jitter_ms: u32) -> Self {
-        let target_frames = ((jitter_ms as usize + FRAME_MS as usize - 1)
-            / FRAME_MS as usize)
-            .clamp(1, 64);
+        let target_frames =
+            ((jitter_ms as usize + FRAME_MS as usize - 1) / FRAME_MS as usize).clamp(1, 64);
 
         Self {
             packets: BTreeMap::new(),
@@ -75,9 +74,8 @@ impl JitterBuffer {
 
         if distance as usize >= self.max_frames {
             self.packets.clear();
-            self.next_sequence = Some(
-                sequence.wrapping_sub(self.target_frames.saturating_sub(1) as u32),
-            );
+            self.next_sequence =
+                Some(sequence.wrapping_sub(self.target_frames.saturating_sub(1) as u32));
         }
 
         if self.packets.len() >= self.max_frames && !self.packets.contains_key(&sequence) {
