@@ -12,6 +12,7 @@ struct SonicBridgeApp {
     jitter_ms: u32,
     ttl: u8,
     relay_only: bool,
+    key_hex: String,
     role: Role,
     process: Option<Child>,
     started_at: Option<Instant>,
@@ -46,6 +47,7 @@ impl SonicBridgeApp {
             jitter_ms: 60,
             ttl: 8,
             relay_only: false,
+            key_hex: String::new(),
             role: Role::Client,
             ..Default::default()
         }
@@ -112,6 +114,10 @@ impl SonicBridgeApp {
                     "--ttl",
                     &self.ttl.to_string(),
                 ]);
+
+                if !self.key_hex.trim().is_empty() {
+                    command.args(["--key-hex", self.key_hex.trim()]);
+                }
             }
             Role::Receiver | Role::Relay => {
                 command.args([
@@ -127,6 +133,10 @@ impl SonicBridgeApp {
 
                 if self.relay_only {
                     command.arg("--relay-only");
+                }
+
+                if !self.key_hex.trim().is_empty() {
+                    command.args(["--key-hex", self.key_hex.trim()]);
                 }
             }
         }
@@ -180,7 +190,7 @@ impl eframe::App for SonicBridgeApp {
 
         egui::Panel::top("top").show(ui, |ui| {
             ui.horizontal(|ui| {
-                ui.heading("SonicBridge");
+                ui.heading("SonicBridge v0.3");
                 ui.label("PC → Pi → Bluetooth");
                 ui.separator();
                 ui.label(if self.process.is_some() {
@@ -228,6 +238,17 @@ impl eframe::App for SonicBridgeApp {
                         ui.label("Packet TTL");
                         ui.add(egui::Slider::new(&mut self.ttl, 1..=32));
                     });
+                    ui.horizontal(|ui| {
+                        ui.label("Encryption key");
+                        ui.add(
+                            egui::TextEdit::singleline(&mut self.key_hex)
+                                .password(true)
+                                .hint_text("64 hex characters"),
+                        );
+                    });
+                    ui.small(
+                        "Optional XChaCha20-Poly1305 key. The same key must be configured on the receiver.",
+                    );
                     ui.small(
                         "System audio capture uses native Windows WASAPI loopback through flexaudio.",
                     );
@@ -251,6 +272,17 @@ impl eframe::App for SonicBridgeApp {
                     ui.checkbox(
                         &mut self.relay_only,
                         "Relay only (do not play locally)",
+                    );
+                    ui.horizontal(|ui| {
+                        ui.label("Encryption key");
+                        ui.add(
+                            egui::TextEdit::singleline(&mut self.key_hex)
+                                .password(true)
+                                .hint_text("64 hex characters"),
+                        );
+                    });
+                    ui.small(
+                        "Relays forward encrypted packets without needing the encryption key.",
                     );
                     ui.small(
                         "A relay can forward audio to another Pi while optionally playing it locally.",
