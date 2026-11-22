@@ -1,6 +1,5 @@
 # SonicBridge
 
-> Your PC makes the noise. The Raspberry Pi gets the Bluetooth job.
 
 SonicBridge is a small Rust audio relay for the slightly ridiculous problem of wanting a Windows PC to play through Bluetooth headphones or speakers attached to a Raspberry Pi.
 
@@ -53,9 +52,8 @@ The core remains deliberately boring. That is a compliment.
        OnePlus Buds
        / speaker
 
-The Pi does not magically increase the electrical volume of the original signal. It acts as a networked audio middleman and can retransmit the stream to another node.
+The Pi does not magically increase the electrical volume of the original signal. It acts as a networked audio middleman and can re-transmit the stream to another node.
 
-That distinction matters. Otherwise we would be selling networking as a power amplifier.
 
 ## Why Rust?
 
@@ -108,7 +106,7 @@ The GUI exposes the settings that actually matter:
 - relay-only mode
 - optional 256-bit transport key
 
-The GUI does not replace the daemon. It controls it.
+The GUI does not replace the daemon.
 
 That keeps the Pi installation tiny while still giving a desktop user an easy control surface.
 
@@ -402,15 +400,12 @@ There is no:
 - browser runtime
 - unbounded queue
 - giant audio history
-- "we'll clean it up later" allocator
 
 Audio is processed in small fixed-duration chunks.
 
 Queues are bounded.
 
 Old audio is disposable.
-
-If the network is behind, the system should lose audio rather than slowly transform a 20 ms delay into a 20 second delay.
 
 ## Current roadmap
 
@@ -456,8 +451,6 @@ If the network is behind, the system should lose audio rather than slowly transf
 
 ## The important bit
 
-SonicBridge is still not trying to become a media server, Bluetooth stack, or distributed Spotify clone.
-
 It has a simpler job:
 
 **take the audio your computer is already producing, move it across a network, let one or more Raspberry Pis relay it, and finally hand it to the Linux Bluetooth stack.**
@@ -466,9 +459,6 @@ The CLI keeps the system usable as a headless daemon.
 
 The GUI makes the same system usable by an actual human.
 
-Both talk to the same underlying audio pipeline.
-
-That is the platform.
 
 ## License
 
